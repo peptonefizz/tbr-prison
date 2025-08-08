@@ -1,0 +1,595 @@
+---
+title: "tbr-prison analysis"
+format:
+  html:
+    toc: false             
+    number-sections: true 
+    code-fold: true       
+    self-contained: true  
+---
+
+```{r}
+#| label: "setup"
+#| include: false
+suppressMessages(if (!require("pacman")) install.packages("pacman"))
+pacman::p_load(tidyverse,rio,janitor,here,sessioninfo,gtsummary, kableExtra, huxtable, openxlsx, ggrepel)
+```
+
+```{r}
+#| label: "import"
+#| include: false
+#| 
+master <- import(here("Data","tbr_prison.csv"))
+```
+
+```{r}
+#| label: "calculation"
+#| include: false
+
+# Number needed to screen
+master <- master %>%
+   mutate(nns_af    = screened/tb_af,
+          nns_bplus = screened/tb_bplus,
+          
+          yield_af = tb_af/tested,
+          yield_bplus = tb_bplus/tested,
+          
+          nnt_af    = tested/tb_af,
+          nnt_bplus = tested/tb_bplus,
+          ) %>% 
+# Pre-diagnosis loss to follow-up = presumptive not tested
+  mutate(
+    pdlfu = 1 - (tested / presumptive),
+# Label PDLFU<= because some projects tested more than number of presumptives
+    pdlfuLess0 = ifelse(pdlfu < 0, TRUE, FALSE),
+    
+    pdlfu = ifelse(is.nan(pdlfu) | pdlfu < 0, NA, pdlfu),
+    )
+```
+
+```{r}
+#| label: "project-level details"
+#| include: false
+
+binary_vars <- c(
+  "screening_stage_mass_screening",
+  "screening_stage_entry_screening",
+  "screening_stage_referral_screening",
+  "screening_stage_exit_screening",
+  "screening_point_intake",
+  "screening_point_in_prison",
+  "screening_point_exit",
+  "screening_point_post_prison",
+  "screening_methods_symptom",
+  "screening_methods_cxr",
+  "screening_methods_cxr_ai",
+  "screening_methods_risk_factor",
+  "screening_methods_contact_tracing",
+  "screening_methods_hiv",
+  "testing_methods_genexpert",
+  "testing_methods_culture",
+  "testing_methods_tst",
+  "testing_methods_smear",
+  "subpopulation_prisoners",
+  "subpopulation_ex_prisoners",
+  "subpopulation_staff",
+  "subpopulation_staff_family",
+  "subpopulation_prisoner_family"
+)
+
+project_df <- master %>%
+  group_by(project_code) %>%
+  summarise(
+    n_intervention   = n(),
+    year_implemented = first(year_implemented),
+    country          = first(country),
+    who_region       = first(who_region),
+    wave             = first(wave),
+    # Aggregate binary columns: if any row is 1, the result is 1.
+    across(all_of(binary_vars), 
+           ~ if_else(max(.x, na.rm = TRUE, default = 0) >= 1, "Yes", "No")),
+    # For subpopulation_other, if any text exists (non-missing and non-empty), set to 1; else 0.
+    subpopulation_other = if_else(
+      any(!is.na(subpopulation_other) & subpopulation_other != ""),
+      "Yes", "No"
+    ),
+    .groups = "drop"
+  )
+
+project_df
+
+# exporting project-level details
+export(project_df, here("Data","tbr_project_details.csv"))
+```
+
+```{r}
+#| label: "project-level descriptive table"
+#| include: true
+#| echo: true
+
+# Table with basic project variables
+tbl_det <-project_df %>%
+  # Exclude n_intervention and project_code for the descriptive table
+  select(country, who_region, wave) %>%
+  tbl_summary(
+    missing = "no",
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    label = list(
+      country                           = "Country",
+      who_region                        = "WHO Region",
+      wave                              = "Wave"
+    )
+  ) %>%
+  modify_header(stat_by = "**{level}**")
+
+# Creating table with screening and testing variables
+screening_stage_vars <- c("screening_stage_mass_screening", 
+                          "screening_stage_entry_screening", 
+                          "screening_stage_referral_screening", 
+                          "screening_stage_exit_screening")
+
+screening_point_vars <- c("screening_point_intake", 
+                          "screening_point_in_prison", 
+                          "screening_point_exit", 
+                          "screening_point_post_prison")
+
+screening_methods_vars <- c("screening_methods_symptom", 
+                            "screening_methods_cxr", 
+                            "screening_methods_cxr_ai", 
+                            "screening_methods_risk_factor", 
+                            "screening_methods_contact_tracing", 
+                            "screening_methods_hiv")
+
+testing_methods_vars <- c("testing_methods_genexpert", 
+                          "testing_methods_culture", 
+                          "testing_methods_tst", 
+                          "testing_methods_smear")
+
+subpopulation_vars <- c("subpopulation_prisoners", 
+                        "subpopulation_ex_prisoners", 
+                        "subpopulation_staff", 
+                        "subpopulation_staff_family", 
+                        "subpopulation_prisoner_family", 
+                        "subpopulation_other")
+
+
+# 1) SCREENING STAGE
+tbl_screening_stage <- project_df %>%
+  tbl_summary(
+    include = all_of(screening_stage_vars),
+    label = list(
+      screening_stage_mass_screening    = "Mass screening",
+      screening_stage_entry_screening   = "Entry screening",
+      screening_stage_referral_screening= "Referral screening",
+      screening_stage_exit_screening    = "Exit screening"
+    ),
+    missing = "no",
+    statistic = all_categorical() ~ "{n} ({p}%)"
+  ) 
+
+# 2) SCREENING POINT
+tbl_screening_point <- project_df %>%
+  tbl_summary(
+    include = all_of(screening_point_vars),
+    label = list(
+      screening_point_intake      = "Intake",
+      screening_point_in_prison   = "In-prison",
+      screening_point_exit        = "Exit",
+      screening_point_post_prison = "Post-prison"    
+      ),
+    missing = "no",
+    statistic = all_categorical() ~ "{n} ({p}%)"
+  ) 
+
+# 3) SCREENING METHODS
+tbl_screening_methods <- project_df %>%
+  tbl_summary(
+    include = all_of(screening_methods_vars),
+    missing = "no",
+    label = list(
+      screening_methods_symptom         = "Symptom",
+      screening_methods_cxr             = "CXR",
+      screening_methods_cxr_ai          = "CXR-AI",
+      screening_methods_risk_factor     = "Risk Factor",
+      screening_methods_contact_tracing = "Contact Tracing",
+      screening_methods_hiv             = "HIV"
+    ),
+    statistic = all_categorical() ~ "{n} ({p}%)"
+  )
+
+# 4) TESTING METHODS
+tbl_testing_methods <- project_df %>%
+  tbl_summary(
+    include = all_of(testing_methods_vars),
+    missing = "no",
+    label = list(
+      testing_methods_genexpert = "GeneXpert",
+      testing_methods_culture   = "Culture",
+      testing_methods_tst       = "TST",
+      testing_methods_smear     = "Smear"
+    ),
+    statistic = all_categorical() ~ "{n} ({p}%)"
+  )
+
+# 5) SUBPOPULATIONS
+tbl_subpopulation <- project_df %>%
+  tbl_summary(
+    include = all_of(subpopulation_vars),
+    missing = "no",
+    label = list(
+      subpopulation_prisoners       = "Prisoners",
+      subpopulation_ex_prisoners    = "Ex-Prisoners",
+      subpopulation_staff           = "Staff",
+      subpopulation_staff_family    = "Staff Family",
+      subpopulation_prisoner_family = "Prisoner Family",
+      subpopulation_other           = "Other"
+    ),
+    statistic = all_categorical() ~ "{n} ({p}%)"
+  ) 
+
+#Stacking the tables into one final descriptive table
+table_project <- tbl_stack(list(tbl_det, tbl_screening_stage,
+                            tbl_screening_point,
+                            tbl_screening_methods,
+                            tbl_testing_methods,
+                            tbl_subpopulation
+                           ), group_header = c("Project details","Screening Stage",
+                                               "Screening Point","Screening Methods", 
+                                               "Testing Methods","Subpopulation") 
+                           )
+
+table_project
+
+# exporting table as huxtable along with data
+gtsummary::as_hux_xlsx(table_project, file = here("Output","TableDescriptive.xlsx"))
+
+wb <- openxlsx::loadWorkbook(here("Output","TableDescriptive.xlsx"))
+openxlsx::addWorksheet(wb, sheetName = "project_details")
+openxlsx::writeData(wb, sheet = "project_details", x = project_df)
+openxlsx::saveWorkbook(wb, here("Output","TableDescriptive.xlsx"), overwrite = TRUE)
+rm(wb)
+```
+
+```{r}
+#| label: "function summarizing"
+#| include: true
+#| echo: false
+
+# Summary for estimates - unweighted
+estimate <- function(data, var, digits = 1, nsmall = 3) {
+  var <- enquo(var)
+  var_name <- quo_name(var)
+  
+  data %>%
+    summarize(
+      Variable       = var_name,
+      Median         = median(!!var,   na.rm = TRUE),
+      IQR            = IQR(    !!var,   na.rm = TRUE),
+      Q1             = quantile(!!var, 0.25, na.rm = TRUE),
+      Q3             = quantile(!!var, 0.75, na.rm = TRUE),
+      Low            = min(    !!var,   na.rm = TRUE),
+      High           = max(    !!var,   na.rm = TRUE),
+      n_non_missing  = sum(!is.na(!!var)),
+      n_missing      = sum( is.na(!!var)),
+      count = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(across(where(is.numeric), ~format(., digits = digits, nsmall = nsmall)))
+}
+
+# Summary for weighted estimates
+estimate_wt <- function(data, var, wt, digits = 1, nsmall = 3) {
+  var <- enquo(var)
+  wt  <- enquo(wt)
+  var_name <- paste0(quo_name(var), "_wt")
+  
+  data %>%
+    summarize(
+      Variable       = var_name,
+      WeightedInvMean = ceiling(1 / weighted.mean(1 / (!!var), (!!wt), na.rm = TRUE)),
+      Low            = min(   (!!var), na.rm = TRUE),
+      High           = max(   (!!var), na.rm = TRUE),
+      n_non_missing  = sum(!is.na((!!var))),
+      n_missing      = sum( is.na((!!var))),
+      count = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(across(where(is.numeric), ~format(., digits = digits, nsmall = nsmall)))
+}
+
+# Weighted estimates for groups
+estimate_weighted <- function(data, vars, numerators, weight) {
+  wgt_sym <- sym(weight)
+
+  # Loop over numerators and grouping variables
+  purrr::map_dfr(numerators, function(numerator) {
+    num_sym <- sym(numerator)
+    purrr::map_dfr(vars, function(var) {
+      var_sym <- sym(var)
+
+      data %>%
+        filter(!is.na(!!num_sym), !is.na(!!var_sym)) %>%
+        group_by(!!var_sym) %>%
+        estimate_wt(!!num_sym, !!wgt_sym) %>%
+        ungroup() %>%
+        # Add identifiers as factors
+        mutate(
+          numerator   = factor(numerator),
+          variable    = factor(var),
+          option_name = factor(as.character(!!var_sym))
+        ) %>%
+        # Reorder and drop raw grouping column and duplicate 'Variable'
+        select(numerator, variable, option_name, everything()) %>%
+        select(-!!var_sym, -Variable) %>%
+        # Ceiling and coerce metric columns to numeric
+        mutate(across(-c(numerator, variable, option_name),  ~ ceiling(as.numeric(.))))
+    })
+  })
+}
+
+```
+
+```{r}
+#| label: "pdlfu table"
+#| include: true
+#| echo: true
+
+# PDLFU overall
+pdlfu_summary <- estimate(master, pdlfu)
+  
+pdlfu_NA <- master %>% 
+  filter(is.na(pdlfu))
+
+pdlfu_morethan0 <- master %>% 
+  filter(pdlfu != 0)
+```
+
+```{r}
+#| label: "nnt"
+#| include: true
+#| echo: true
+
+nnt_af_summary <- estimate(master, nnt_af)
+nnt_bplus_summary <- estimate(master, nnt_bplus)
+```
+
+```{r}
+#| label: "nns"
+#| include: true
+#| echo: true
+
+nns_af_summary <- estimate(master, nns_af)
+nns_bplus_summary <- estimate(master, nns_bplus)
+
+nns_af_summary_wt  <- estimate_wt(master, nns_af, screened)
+nns_bplus_summary_wt  <- estimate_wt(master, nns_bplus, screened)
+
+
+estimate_summary   <- bind_rows(pdlfu_summary, nnt_af_summary, nnt_bplus_summary, nns_af_summary, nns_bplus_summary, nns_af_summary_wt, nns_bplus_summary_wt)
+
+# export
+rio::export(
+  list(
+    estimate_summary = estimate_summary,
+    pdlfu_morethan0 = pdlfu_morethan0,
+    pdlfu_NA      = pdlfu_NA
+  ),
+  here::here("Output", "estimate_summary.xlsx")
+)
+```
+
+```{r}
+#| label: "new categories"
+#| include: true
+#| echo: true
+
+# ----------------------------------------
+# Screening point 
+# ----------------------------------------
+master <- master %>%
+  mutate(
+    screening_point = recode(
+      screening_point,
+      "In-prison"                        = "In Prison",
+      "Intake"                           = "Intake",
+      "Exit"                             = "Exit",
+      "Post-prison"                      = "Post Prison",
+      "Detention-associated environment" = "Detention Associated Environment",
+      "Intake, In-prison"                = "Intake; In Prison",
+      "Intake and In-prison"             = "Intake; In Prison",
+      "In-prison, Post-prison"           = "In Prison; Post Prison",
+      "Intake, In-prison, Exit"          = "Intake; In Prison; Exit"
+    ),
+    screening_point = factor(
+      screening_point,
+      levels = c(
+        "Intake",
+        "In Prison",
+        "Exit",
+        "Post Prison",
+        "Detention Associated Environment",
+        "Intake; In Prison",
+        "In Prison; Post Prison",
+        "Intake; In Prison; Exit"
+      )
+    )
+  ) 
+# ----------------------------------------
+# Screening method
+# ----------------------------------------
+master <- master %>%
+ mutate(
+    cxr = pmax(screening_methods_cxr, screening_methods_cxr_ai)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    screening_method = str_c(
+      c("Symptom", "CXR", "Risk factor", "Contact tracing", "HIV")[
+        c_across(c(
+          screening_methods_symptom,
+          cxr,
+          screening_methods_risk_factor,
+          screening_methods_contact_tracing,
+          screening_methods_hiv
+        )) == 1
+      ],
+      collapse = ", "
+    )
+  ) %>%
+  ungroup()
+
+# determine factor levels dynamically
+method_levels <- master %>%
+  distinct(screening_method) %>%
+  arrange(str_count(screening_method, ","), screening_method) %>%
+  pull(screening_method)
+
+# apply ordered factor
+master <- master %>%
+  mutate(
+    screening_method = factor(screening_method, levels = method_levels)
+  )
+
+# ----------------------------------------
+# Subpopulation transformation
+# ----------------------------------------
+master <- master %>%
+  mutate(
+    other_ind = if_else(
+      !is.na(subpopulation_other) & str_trim(as.character(subpopulation_other)) != "" & subpopulation_other != "0",
+      1L, 
+      0L
+    )
+  ) %>%
+  # collapse existing subpopulation flags
+  mutate(
+    pop_prisoners    = subpopulation_prisoners,
+    pop_ex_prisoners = subpopulation_ex_prisoners,
+    pop_staff        = subpopulation_staff,
+    pop_staff_family = subpopulation_staff_family,
+    pop_prisoner_family = subpopulation_prisoner_family,
+    pop_other        = other_ind
+  ) %>%
+  rowwise() %>%
+  mutate(
+    subpopulation = str_c(
+      c("Prisoners", "Ex-prisoners", "Staff", "Staff family", "Prisoner family", "Other")[
+        c_across(c(
+          pop_prisoners,
+          pop_ex_prisoners,
+          pop_staff,
+          pop_staff_family,
+          pop_prisoner_family,
+          pop_other
+        )) == 1
+      ],
+      collapse = ", "
+    )
+  ) %>%
+  ungroup()
+
+# manually specify logical order for subpopulation levels
+single_levels <- c(
+  "Prisoners",
+  "Ex-prisoners",
+  "Staff",
+  "Staff family",
+  "Prisoner family",
+  "Other"
+)
+
+# build full levels: singles first, then any combinations
+all_levels <- c(
+  single_levels,
+  setdiff(
+    unique(master$subpopulation),
+    single_levels
+  )
+)
+
+master <- master %>%
+  mutate(
+    subpopulation = fct_relevel(
+      subpopulation,
+      single_levels,
+      after = 0
+    )
+  )
+```
+
+```{r}
+#| label: "weighted estimates for new variable"
+#| include: true
+#| echo: true
+
+weighted_summary <- estimate_weighted(
+  master,
+  vars = c("screening_point", "screening_method","subpopulation"),
+  numerators = c("nns_af", "nns_bplus"),
+  weight = "screened"
+)
+
+data_labeled <- weighted_summary %>%
+  mutate(
+    variable = factor(variable,
+                      levels = c("screening_point", "screening_method", "subpopulation"),
+                      labels = c("Screening point", "Screening method", "Subpopulation")),
+    est.lab = sprintf("%d (%d, %d)",
+                      as.integer(WeightedInvMean),
+                      as.integer(Low),
+                      as.integer(High)),
+    est.lab = gsub("NA", "Undefined", est.lab),
+    option_label = sprintf("%s (n=%d)", option_name, count)
+  ) %>%
+  mutate(
+    est.lab = if_else(count == 1, as.character(Low), est.lab)
+  )
+
+# Figures
+p_af <- data_labeled %>%
+  filter(numerator == "nns_af") %>%
+  ggplot(aes(y = reorder(option_label, -WeightedInvMean))) +
+  geom_point(aes(x = WeightedInvMean, color = variable), show.legend = FALSE) +
+  geom_linerange(aes(xmin = Low, xmax = High, color = variable), show.legend = FALSE) +
+  facet_grid(variable ~ ., scales = "free_y", space = "free_y") +
+  geom_text_repel(aes(x = WeightedInvMean, label = est.lab),
+                  size = 3,
+                  nudge_x = 0.1,
+                  nudge_y = 0.4,
+                  hjust = -0.1) +
+  labs(x = "Weighted mean NNS (All forms TB)",
+       y = "",
+       color = NULL) +
+  theme_bw() +
+  theme(strip.text = element_text(size = 9)) +
+  coord_cartesian(expand = TRUE)
+
+# Plot for nns_bplus
+p_bplus <- data_labeled %>%
+  filter(numerator == "nns_bplus") %>%
+  ggplot(aes(y = reorder(option_label, -WeightedInvMean))) +
+  geom_point(aes(x = WeightedInvMean, color = variable), show.legend = FALSE) +
+  geom_linerange(aes(xmin = Low, xmax = High, color = variable), show.legend = FALSE) +
+  facet_grid(variable ~ ., scales = "free_y", space = "free_y") +
+  geom_text_repel(aes(x = WeightedInvMean, label = est.lab),
+                  size = 3,
+                  nudge_x = 0.1,
+                  nudge_y = 0.4,
+                  hjust = -0.1) +
+  labs(x = "Weighted mean NNS (B+ TB)",
+       y = "",
+       color = NULL) +
+  theme_bw() +
+  theme(strip.text = element_text(size = 9)) +
+  coord_cartesian(expand = TRUE)
+
+# Save figures
+ggsave(here("Output","Figure_weighted_nns_af.png"),
+       plot = p_af,
+       width = 8, height = 7.5, units = "in")
+
+ggsave(here("Output","Figure_weighted_nns_bplus.png"),
+       plot = p_bplus,
+       width = 8, height = 7.5, units = "in")
+
+```

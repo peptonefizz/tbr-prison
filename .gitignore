@@ -1,0 +1,42 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Ignore everything
+*
+
+# Git and Gitignore
+!.gitignore
+
+# Don't ignore directories
+!*/
+Archive
+
+# Don't ignore anywhere
+!**/*.Rmd
+!**/*.qmd
+!**/*.md
+!**/*.R
+!**/*.Rproj
+
+**/*.xlsx
+**/*.jpg
+**/*.png
+**/*.pdf
+**/*.RDS
+
+# session info
+Session\ info/*.txt
+
+# Ignore
+Data/Data*.xlsx
+
+Scripts/internal*.R
+Scripts/internal*.Rmd
+Scripts/internal*.qmd
+
+.DS_Store
+.Rproj.user
+
+/.quarto/
