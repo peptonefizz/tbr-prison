@@ -473,7 +473,7 @@ master <- master %>%
   rowwise() %>%
   mutate(
     subpopulation = str_c(
-      c("Prisoners", "Ex-prisoners", "Staff", "Staff family", "Prisoner family", "Other")[
+      c("PDL", "Ex-PDL", "Staff", "Staff family", "PDL family", "Other")[
         c_across(c(
           pop_prisoners,
           pop_ex_prisoners,
@@ -490,11 +490,11 @@ master <- master %>%
 
 # manually specify logical order for subpopulation levels
 single_levels <- c(
-  "Prisoners",
-  "Ex-prisoners",
+  "PDL",
+  "Ex-PDL",
   "Staff",
   "Staff family",
-  "Prisoner family",
+  "PDL family",
   "Other"
 )
 
