@@ -1,0 +1,30 @@
+project:
+  type: default
+  title: "tbr-analysis"
+  render:
+    - scripts/01_analyze.qmd
+    - scripts/02_map.qmd
+  # Run every document from the project root, not from scripts/. Without this
+  # renv's .Rprofile is never sourced during a render and the documents would
+  # silently use the user library instead of the project library.
+  execute-dir: project
+
+# Shared by every .qmd in the pipeline. Individual documents carry only
+# title and date; anything format-related belongs here.
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+
+execute:
+  warning: false
+  message: false
+  freeze: false
+
+editor: visual

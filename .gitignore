@@ -1,0 +1,47 @@
+# R / RStudio / Quarto build artifacts
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+/.quarto/
+*_files/
+.DS_Store
+Rplots.pdf
+
+# Whitelist strategy: ignore everything, then allow back only what is safe to publish.
+*
+!.gitignore
+!*/
+
+# Allowed — public analysis code, metadata and the analysis dataset
+!scripts/*.R
+!scripts/01_analyze.qmd
+!scripts/02_map.qmd
+!*.Rproj
+!_quarto.yml
+!README.md
+!/data/tbr_prison.csv
+
+# renv: the lockfile and the activation shim are the reproducibility record and
+# must be tracked. The project library itself must never be.
+!renv.lock
+!.Rprofile
+!renv/activate.R
+!renv/settings.json
+
+# Hard blocks. Last, so they beat every rule above.
+# Private source material and generated outputs are never published.
+/HANDOVER.md
+/manuscript/
+/qualitative/
+/refs/
+/data-raw/
+/output/
+/archive/
+/session-info/
+scripts/internal*
+/renv/library/
+/renv/staging/
+/renv/sandbox/
+/renv/local/
+/renv/cellar/

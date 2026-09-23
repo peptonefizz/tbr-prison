@@ -1,0 +1,398 @@
+---
+title: "TBR prison: global distribution map"
+date: now
+---
+
+Projects by country. Robinson projection, on the United Nations Geospatial basemap.
+
+```{r}
+#| label: setup
+#| include: false
+suppressPackageStartupMessages({
+  library(rio)
+  library(dplyr)
+  library(ggplot2)
+  library(sf)
+  library(countrycode)
+  library(grid)
+  library(here)
+  library(sessioninfo)
+})
+
+set.seed(42)
+dir.create(here("output"), showWarnings = FALSE)
+```
+
+```{r}
+#| label: basemap-download
+#| include: true
+#| echo: true
+
+# United Nations Geospatial simplified world layer (BNDA = boundary areas).
+# Natural Earth draws Somaliland separately, which left a hole in Somalia.
+# Downloaded once into data-raw/basemap/ (git-ignored); delete it to re-fetch.
+
+basemap_dir <- here("data-raw", "basemap")
+
+un_layers <- tibble::tribble(
+  ~name,              ~item_id,
+  "BNDA_simplified",  "6d6fb235f64d47248a5e3b78ef4b6273"
+) %>%
+  mutate(
+    url  = sprintf("https://geoportal.un.org/arcgis/sharing/rest/content/items/%s/data", item_id),
+    path = file.path(basemap_dir, paste0(name, ".geojson"))
+  )
+
+dir.create(basemap_dir, showWarnings = FALSE, recursive = TRUE)
+for (i in seq_len(nrow(un_layers))) {
+  if (!file.exists(un_layers$path[i])) {
+    message("Downloading ", un_layers$name[i], " from ", un_layers$url[i])
+    # Only cache a complete, readable download; a failed transfer can be retried.
+    local({
+      download_path <- tempfile(tmpdir = basemap_dir, fileext = ".geojson")
+      on.exit(unlink(download_path), add = TRUE)
+      utils::download.file(un_layers$url[i], download_path, mode = "wb", quiet = TRUE)
+      sf::st_read(download_path, quiet = TRUE)
+      if (!file.rename(download_path, un_layers$path[i])) stop("Could not cache the UN basemap")
+    })
+  }
+}
+stopifnot("a UN basemap layer failed to download" = all(file.exists(un_layers$path)))
+
+# Provenance, from the files on disk.
+un_layers <- un_layers %>%
+  mutate(md5 = unname(tools::md5sum(path)),
+         retrieved = format(as.Date(file.mtime(path)), "%Y-%m-%d"),
+         bytes = file.size(path))
+
+writeLines(c(
+  "# Basemap provenance",
+  "",
+  "Source: United Nations Geospatial (geoportal.un.org), simplified world boundary areas layer.",
+  "Retrieved by scripts/02_map.qmd; this directory is git-ignored and is re-fetched if deleted.",
+  "",
+  sprintf("- **%s** (%s)  \n  URL: %s  \n  Retrieved: %s  \n  Size: %s bytes  \n  MD5: `%s`",
+          un_layers$name,
+          "boundary areas: country polygons",
+          un_layers$url, un_layers$retrieved,
+          format(un_layers$bytes, big.mark = ","), un_layers$md5),
+  "",
+  "Attribution to reproduce with any figure derived from this layer:",
+  "",
+  "> Map data: United Nations Geospatial. The boundaries and names shown and the",
+  "> designations used on this map do not imply official endorsement or acceptance",
+  "> by the United Nations."
+), file.path(basemap_dir, "PROVENANCE.md"))
+
+knitr::kable(dplyr::select(un_layers, name, retrieved, bytes, md5),
+             caption = "UN Geospatial basemap layer used for this figure")
+```
+
+```{r}
+#| label: prepare
+#| include: false
+
+project_df <- import(here("data", "tbr_project_details.csv"))
+
+country_counts <- project_df %>%
+  count(country, name = "projects_count") %>%
+  mutate(iso_a3 = countrycode(country, "country.name", "iso3c"))
+
+# Every project country must resolve to an ISO3 code.
+stopifnot(
+  "countrycode() failed to resolve a country name" =
+    !any(is.na(country_counts$iso_a3))
+)
+
+# The simplified BNDA polygons have self-intersections that s2 rejects; use
+# planar GEOS geometry. Areas below are measured in an equal-area projection.
+sf::sf_use_s2(FALSE)
+
+bnda <- suppressWarnings(
+  st_read(un_layers$path[un_layers$name == "BNDA_simplified"], quiet = TRUE) %>%
+    st_make_valid()
+)
+
+# BNDA has one feature per landmass-with-status (262 features, 250 ISO codes).
+# Areas of undetermined status (stscod 99) are held out of the dissolve and
+# drawn in the neutral fill, so a disputed area is not painted in a claimant's
+# colour.
+undetermined <- bnda %>% filter(stscod == 99)
+countries <- bnda %>%
+  filter(stscod != 99) %>%
+  group_by(iso3cd) %>%
+  summarise(.groups = "drop")          # unions the geometries within each code
+
+world_map <- countries %>%
+  left_join(country_counts, by = c("iso3cd" = "iso_a3"), na_matches = "never") %>%
+  mutate(has_projects = !is.na(projects_count))
+
+# One row per country, every project country present, every project counted.
+unmatched <- setdiff(country_counts$iso_a3, countries$iso3cd)
+stopifnot(
+  "the basemap dissolve left more than one row for some country" =
+    !any(duplicated(countries$iso3cd)),
+  "expected 25 project countries" = nrow(country_counts) == 25L,
+  "project countries missing from the basemap" = length(unmatched) == 0,
+  "project count changed across the join" =
+    sum(world_map$projects_count, na.rm = TRUE) == sum(country_counts$projects_count)
+)
+
+# Somalia with Somaliland is ~638,000 km2, without it ~462,000.
+som_area <- as.numeric(sf::st_area(
+  sf::st_transform(world_map[world_map$iso3cd == "SOM", ], "ESRI:54009")))
+stopifnot(
+  "Somalia's polygon is too small: Somaliland is missing from the basemap" =
+    som_area > 6.2e11
+)
+
+# Fill for the countries with a project: the forest figures' peacock, lightened
+# in Lab so dark labels stay legible over it.
+lighten_lab <- function(hex, dL = 16, chroma = 0.90) {
+  lab <- grDevices::convertColor(t(grDevices::col2rgb(hex)) / 255,
+                                 from = "sRGB", to = "Lab",
+                                 from.ref.white = "D65", to.ref.white = "D65")
+  lab[, 1] <- pmin(lab[, 1] + dL, 95)
+  lab[, 2:3] <- lab[, 2:3] * chroma
+  rgb_out <- grDevices::convertColor(lab, from = "Lab", to = "sRGB",
+                                     from.ref.white = "D65", to.ref.white = "D65")
+  grDevices::rgb(pmin(pmax(rgb_out, 0), 1))
+}
+
+project_fill <- lighten_lab("#1F6E73")
+
+# Labels from the project data; the basemap spells six countries differently.
+labels_sf <- world_map %>%
+  filter(!is.na(projects_count)) %>%
+  mutate(map_label = paste0(country, " (", projects_count, ")"))
+```
+
+```{r}
+#| label: layout
+#| include: false
+
+# Same 1060 px canvas and type scale as the NNS forest plot; 159 mm is the
+# manuscript's A4 text column.
+fig_w_mm   <- 159
+type_scale <- 1.20
+CARD_W     <- 1060
+mm_per_px <- fig_w_mm / CARD_W
+px  <- function(v) v * mm_per_px * type_scale   # layout px -> mm (ggplot text size)
+pt  <- function(v) px(v) / 0.3528               # layout px -> points (grid fontsize)
+# Geometry does not scale with type.
+gpx <- function(v) v * mm_per_px                # layout px -> mm (geometry)
+glw <- function(v) gpx(v) / 0.75                # layout px -> ggplot linewidth
+
+PAD_SIDE  <- 16
+CONTENT_W <- CARD_W - 2 * PAD_SIDE
+
+ink <- "#2A2620"; muted <- "#6E6759"; secondary <- "#8A8375"
+gridline <- "#E2DCCE"; land_no_projects <- "#EDE9E0"; page_bg <- "#FFFFFF"
+
+fam <- "Helvetica"
+# ragg drops the dot on a lowercase i in bold Helvetica at this size, so the
+# country labels use Helvetica Neue.
+lab_fam <- "Helvetica Neue"
+LAB_PX  <- 14
+
+# Crop Antarctica. Bounds are read from the projection.
+ROB_Y <- st_coordinates(st_transform(
+  st_sfc(st_point(c(0, -58)), st_point(c(0, 84)), crs = 4326), "ESRI:54030"))[, "Y"]
+ROB_X <- st_coordinates(st_transform(
+  st_sfc(st_point(c(-180, 0)), st_point(c(180, 0)), crs = 4326), "ESRI:54030"))[, "X"]
+
+# Countries listed here get their label in open water with a leader line back
+# to the polygon; others keep the label on the polygon. Positions in lon/lat.
+TARGET_LL <- list(
+  "Haiti"               = c( -63.0,  25.5),  # Atlantic, NE of Hispaniola
+  "Peru"                = c( -92.0, -11.0),  # Pacific
+  "Burkina Faso"        = c( -29.0,  17.5),  # Atlantic column
+  "Ghana"               = c( -26.0,   6.0),
+  "Nigeria"             = c(   0.0,  -8.5),  # Gulf of Guinea
+  "DR Congo"            = c( -19.0, -23.0),  # South Atlantic
+  "Zambia"              = c(  -9.0, -31.0),
+  "Eswatini"            = c(   2.0, -39.0),  # bottom of the South Atlantic column
+  "Sudan"               = c(  16.0,  32.0),  # over the Mediterranean
+  "Ethiopia"            = c(  49.0,  21.0),  # over Arabia
+  "South Sudan"         = c(  70.0,  12.0),  # top of the Indian Ocean column
+  "Somalia"             = c(  66.0,   5.0),
+  "Uganda"              = c(  66.0,  -2.5),
+  "UR of Tanzania"      = c(  66.0,  -9.5),  # leader passes N of Madagascar
+  "Malawi"              = c(  52.0, -30.0),  # S of Madagascar; this order keeps
+  "Mozambique"          = c(  54.0, -37.0),  # the two leaders from crossing
+  "Ukraine"             = c(  -4.0,  63.0),  # Norwegian Sea
+  "Republic of Moldova" = c( -17.0,  52.0),  # Atlantic, W of Ireland
+  "Afghanistan"         = c(  72.0,  54.0),  # over the Kazakh steppe
+  "Tajikistan"          = c( 115.0,  44.0),  # over Mongolia, clear of Afghanistan
+  "Pakistan"            = c(  77.0,  28.0),  # over the Karakoram, clear of Ethiopia
+  "Nepal"               = c(  97.0,  35.0),  # over the Tibetan plateau
+  "Viet Nam"            = c( 120.0,  13.0),  # South China Sea
+  "Indonesia"           = c( 118.0, -14.0)   # SE of Java, clear of the Tanzania column
+)
+stopifnot(
+  "a TARGET_LL entry names a country that is not on the map" =
+    length(setdiff(names(TARGET_LL), labels_sf$country)) == 0
+)
+
+# st_point_on_surface keeps the anchor inside the polygon. It warns on lon/lat
+# input, which is fine for a leader-line endpoint.
+anchor_xy <- st_coordinates(st_transform(
+  suppressWarnings(st_point_on_surface(st_geometry(labels_sf))), "ESRI:54030"))[, 1:2]
+target_xy <- t(vapply(seq_len(nrow(labels_sf)), function(i) {
+  tg <- TARGET_LL[[labels_sf$country[i]]]
+  if (is.null(tg)) return(anchor_xy[i, ])
+  st_coordinates(st_transform(st_sfc(st_point(tg), crs = 4326), "ESRI:54030"))[1, 1:2]
+}, numeric(2)))
+
+label_df <- data.frame(
+  x = target_xy[, 1], y = target_xy[, 2],
+  ax = anchor_xy[, 1], ay = anchor_xy[, 2],
+  lab = labels_sf$map_label, country = labels_sf$country
+)
+
+# Text width measured on the device, so a font substitution widens the box.
+str_w_px <- function(s, size_px, family, face = "bold") {
+  if (length(grDevices::dev.list()) == 0) {
+    grDevices::pdf(NULL); on.exit(grDevices::dev.off(), add = TRUE)
+  }
+  fs <- pt(size_px)
+  vapply(s, function(x) {
+    convertWidth(grobWidth(textGrob(
+      x, gp = gpar(fontfamily = family, fontface = face, fontsize = fs))),
+      "mm", valueOnly = TRUE) / mm_per_px
+  }, numeric(1), USE.NAMES = FALSE)
+}
+
+# Measured once, so the report chunk and the export are identical.
+m_px   <- diff(ROB_X) / CONTENT_W            # projection metres per layout px
+halo_m <- 1.3 * m_px                         # halo offset radius
+
+# Leader lines stop at the edge of the label box. Labels on their own country
+# get no line.
+leader_w <- (str_w_px(label_df$lab, LAB_PX, lab_fam) / 2 + 4) * m_px
+leader_h <- (LAB_PX * type_scale * 0.75 / 2 + 3) * m_px
+leader_dx <- label_df$x - label_df$ax
+leader_dy <- label_df$y - label_df$ay
+leader_t <- pmax(pmin(pmax(
+  ifelse(leader_dx != 0, 1 - leader_w / abs(leader_dx), 0),
+  ifelse(leader_dy != 0, 1 - leader_h / abs(leader_dy), 0)), 1), 0)
+leaders <- data.frame(
+  x = label_df$ax, y = label_df$ay,
+  xend = label_df$ax + leader_t * leader_dx,
+  yend = label_df$ay + leader_t * leader_dy
+)[sqrt(leader_dx^2 + leader_dy^2) > 12 * m_px, ]
+
+# TARGET_LL is hand-placed; fail if two label boxes overlap.
+label_boxes <- data.frame(
+  lab  = label_df$lab,
+  xmin = label_df$x - leader_w, xmax = label_df$x + leader_w,
+  ymin = label_df$y - leader_h, ymax = label_df$y + leader_h
+)
+label_collisions <- local({
+  n <- nrow(label_boxes); out <- character()
+  for (i in seq_len(n - 1)) for (j in seq(i + 1, n)) {
+    if (label_boxes$xmin[i] < label_boxes$xmax[j] &&
+        label_boxes$xmax[i] > label_boxes$xmin[j] &&
+        label_boxes$ymin[i] < label_boxes$ymax[j] &&
+        label_boxes$ymax[i] > label_boxes$ymin[j]) {
+      out <- c(out, paste(label_boxes$lab[i], "<->", label_boxes$lab[j]))
+    }
+  }
+  out
+})
+if (length(label_collisions)) message("label collisions:\n  ",
+                                      paste(label_collisions, collapse = "\n  "))
+stopifnot("two country labels overlap; adjust TARGET_LL" =
+            length(label_collisions) == 0)
+
+# White halo: the label underpainted eight times around a small circle.
+halo_df <- do.call(rbind, lapply(0:7, function(k) {
+  transform(label_df, ox = cos(k * pi / 4), oy = sin(k * pi / 4))
+}))
+
+H_MAP    <- round(CONTENT_W / (diff(ROB_X) / diff(ROB_Y)))   # no letterboxing
+fig_h_mm <- gpx(H_MAP)
+
+map_panel <- function() {
+  ggplot(world_map) +
+    geom_sf(aes(fill = has_projects), colour = "#FFFFFF", linewidth = glw(0.7)) +
+    # Undetermined areas in the neutral fill, no border, under the labels.
+    geom_sf(data = undetermined, fill = land_no_projects, colour = NA,
+            inherit.aes = FALSE) +
+    geom_segment(data = leaders, aes(x = x, y = y, xend = xend, yend = yend),
+                 colour = secondary, alpha = 0.6, linewidth = glw(0.7)) +
+    geom_text(data = halo_df,
+              aes(x = x + ox * halo_m, y = y + oy * halo_m, label = lab),
+              size = px(LAB_PX), fontface = "bold", family = lab_fam,
+              colour = "#FFFFFF") +
+    geom_text(data = label_df, aes(x = x, y = y, label = lab),
+              size = px(LAB_PX), fontface = "bold", family = lab_fam, colour = ink) +
+    scale_fill_manual(values = c(`TRUE` = project_fill, `FALSE` = land_no_projects),
+                      guide = "none") +
+    coord_sf(crs = "ESRI:54030", expand = FALSE, xlim = ROB_X, ylim = ROB_Y) +
+    theme_void() +
+    theme(panel.grid.major = element_line(colour = gridline, linetype = "dotted",
+                                          linewidth = glw(0.7)),
+          panel.background = element_rect(fill = page_bg, colour = NA),
+          plot.background  = element_rect(fill = NA, colour = NA),
+          plot.margin = margin(0, 0, 0, 0))
+}
+
+# Draws on the current device: one code path for the report chunk and the export.
+draw_map <- function() {
+  grid.newpage()
+  grid.rect(gp = gpar(fill = page_bg, col = NA))
+  pushViewport(viewport(x = unit(gpx(PAD_SIDE), "mm"),
+                        width = unit(gpx(CONTENT_W), "mm"), just = "left"))
+  grid.draw(ggplotGrob(map_panel()))
+  popViewport()
+}
+
+# The fig-map chunk sets its device size as a literal; fail if the two drift.
+stopifnot(
+  "fig-width/fig-height on the fig-map chunk no longer match the layout" =
+    all(abs(c(fig_w_mm, fig_h_mm) / 25.4 - c(6.26, 2.59)) < 0.02)
+)
+```
+
+```{r}
+#| label: fig-map
+#| fig-cap: "TB REACH projects screening people deprived of liberty, by country. The number after each country is its project count. Base map is derived from the [United Nations Geospatial simplified world boundary areas layer (BNDA_simplified)](https://geoportal.un.org/arcgis/home/item.html?id=6d6fb235f64d47248a5e3b78ef4b6273)."
+#| fig-width: 6.26
+#| fig-height: 2.59
+
+draw_map()
+```
+
+```{r}
+#| label: save
+#| include: false
+
+# 600 dpi PNG, as save_figure() in 01_analyze.qmd. The device opens inside a
+# function so on.exit closes it if draw_map() fails.
+render_to <- function(open_device) {
+  open_device()
+  on.exit(grDevices::dev.off(), add = TRUE)
+  draw_map()
+}
+
+render_to(function() ragg::agg_png(here("output", "Figure_map_600dpi.png"),
+                                   width = fig_w_mm, height = fig_h_mm,
+                                   units = "mm", res = 600))
+```
+
+```{r}
+#| label: session-info
+#| include: false
+
+dir.create(here("session-info"), showWarnings = FALSE)
+sessioninfo::session_info(
+  pkgs = "loaded",
+  to_file = here("session-info", "session_info_02_map.txt")
+)
+
+# sessioninfo does not report the GDAL/GEOS/PROJ versions behind sf.
+cat(paste(names(sf::sf_extSoftVersion()), sf::sf_extSoftVersion(),
+          sep = ": ", collapse = "\n"),
+    file = here("session-info", "session_info_02_map.txt"), append = TRUE)
+```

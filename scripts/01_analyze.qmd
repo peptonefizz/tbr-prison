@@ -1,0 +1,1955 @@
+---
+title: "TBR prison: analysis"
+date: now
+---
+
+Reads the published analysis dataset, `data/tbr_prison.csv`, and produces the report's tables and figures: what the projects did, the number needed to screen (NNS) and number needed to test (NNT), those estimates broken down by screening point, method and population, and a decomposition of the NNS into the three steps of the screening cascade.
+
+Two units of analysis run side by side and are never mixed:
+
+-   **Projects** (N = 35) are the unit of the characteristics table. A project counts once in a row if any of its interventions used that stage, point, method or population, so rows are not mutually exclusive.
+-   **Interventions** (N = 67) are the unit of every estimate. A single project contributes up to ten of them.
+
+Three conventions hold throughout:
+
+-   A ratio with a zero denominator and a non-zero numerator is undefined (`Inf`), after Garg et al. (*Lancet Reg Health Southeast Asia* 2022). An intervention that screened people and found no case still counts towards (n) and still contributes its screened count to a pooled denominator; `NA` is reserved for a missing input and for 0/0.
+-   A pooled estimate is a ratio of totals, so an intervention counts in proportion to how many people it screened.
+-   Quantiles are rounded to the nearest whole person, and range endpoints are rounded up: an NNS of 13.9 means 14 people must be screened to expect one case.
+
+Each section names the files it writes. They all land in `output/` (`TableDescriptive.xlsx`, `estimate_summary.xlsx`, `supplementary_tables.xlsx` and four figures, each written once as a 600 dpi PNG) apart from the project-level roll-up, which goes to `data/tbr_project_details.csv`.
+
+## Setup and derived measures
+
+Imports `data/tbr_prison.csv`, rebuilds the `wave` ordering that the CSV round-trip loses, and derives the ratios the rest of the document works from:
+
+| Measure               | Definition                                                                                             |
+|-----------------------|--------------------------------------------------------------------------------------------------------|
+| `nns_af`, `nns_bplus` | Number needed to screen: people screened per case diagnosed, all forms and bacteriologically confirmed |
+| `nnt_af`, `nnt_bplus` | Number needed to test: people tested per case diagnosed, on the same two case definitions               |
+| `pdlfu`               | Pre-diagnosis loss to follow-up: the share of people classified presumptive who were never tested       |
+
+Where more people were tested than were classified presumptive, which is what mass screening does, `pdlfu` would go negative, so it is set to missing; it is also missing wherever either of its two inputs is. Three interventions (the Republic of Moldova, Waves 2 and 4, referral-based by design) recorded no screened population, so the per-intervention NNS runs on 64 of 67. Their NNT is unaffected, because `tested` is recorded for all three.
+
+```{r}
+#| label: setup
+#| include: false
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(rio)
+  library(here)
+  library(gtsummary)
+  library(gt)
+  library(openxlsx)
+  library(sessioninfo)
+})
+
+set.seed(42)
+```
+
+```{r}
+#| label: import
+#| include: false
+
+data_path <- here("data", "tbr_prison.csv")
+if (!file.exists(data_path)) stop("Missing published dataset: ", data_path)
+master <- import(data_path)
+dir.create(here("output"), showWarnings = FALSE)
+
+# Validate the published dataset.
+count_vars <- c("screened", "presumptive", "tested", "tb_af", "tb_bplus")
+flag_vars <- c(
+  paste0("screening_stage_", c("mass_screening", "entry_screening", "referral_screening", "exit_screening")),
+  paste0("screening_point_", c("intake", "in_prison", "exit", "post_prison")),
+  paste0("screening_methods_", c("symptom", "cxr", "cxr_ai", "risk_factor", "contact_tracing", "hiv")),
+  paste0("testing_methods_", c("genexpert", "culture", "tst", "smear")),
+  paste0("subpopulation_", c("prisoners", "ex_prisoners", "staff", "staff_family", "prisoner_family"))
+)
+required_vars <- c("intervention_id", "project_code", "country", "who_region",
+                   "year_implemented", "wave", "screening_point", "subpopulation_other",
+                   count_vars, flag_vars)
+missing_vars <- setdiff(required_vars, names(master))
+if (length(missing_vars)) stop("Missing analysis columns: ", paste(missing_vars, collapse = ", "))
+stopifnot(
+  "expected 67 interventions, 35 projects and 25 countries" =
+    nrow(master) == 67L && n_distinct(master$project_code) == 35L && n_distinct(master$country) == 25L,
+  "intervention identifiers must be unique and complete" =
+    !anyNA(master$intervention_id) && all(nzchar(master$intervention_id)) &&
+    !anyDuplicated(master$intervention_id),
+  "project identifiers and countries must be complete" =
+    !anyNA(master$project_code) && all(nzchar(master$project_code)) &&
+    !anyNA(master$country) && all(nzchar(master$country)),
+  "counts must be numeric, non-negative whole numbers or missing" =
+    all(vapply(master[count_vars], function(x) is.numeric(x) &&
+      all(is.na(x) | (is.finite(x) & x >= 0 & x == trunc(x))), logical(1))),
+  "indicator columns must contain only 0, 1 or missing values" =
+    all(vapply(master[flag_vars], function(x) all(is.na(x) | x %in% c(0, 1)), logical(1)))
+)
+
+# wave comes back as text from the CSV; restore the numeric ordering.
+wave_numbers <- sort(unique(as.integer(str_match(master$wave, "^Wave (\\d+)$")[, 2])))
+master <- master %>%
+  mutate(wave = factor(wave, levels = paste("Wave", wave_numbers)))
+stopifnot("wave failed to parse" = !any(is.na(master$wave)))
+```
+
+```{r}
+#| label: calculation
+#| include: false
+
+# Garg et al. (Lancet Reg Health Southeast Asia 2022): a zero denominator with a
+# non-zero numerator is undefined (Inf), not missing. NA is a missing input or 0/0.
+count_ratio <- function(numerator, denominator) {
+  out <- numerator / denominator
+  out[is.na(numerator) | is.na(denominator) | is.nan(out)] <- NA_real_
+  out
+}
+
+# The three Republic of Moldova interventions have no screened count (referral-based), so
+# per-intervention NNS runs on 64 of 67. Their NNT is unaffected.
+master <- master %>%
+  mutate(
+    nns_af    = count_ratio(screened, tb_af),
+    nns_bplus = count_ratio(screened, tb_bplus),
+    nnt_af    = count_ratio(tested,   tb_af),
+    nnt_bplus = count_ratio(tested,   tb_bplus),
+    # Pre-diagnosis loss to follow-up; negative (tested > presumptive) is missing.
+    pdlfu = 1 - (tested / presumptive),
+    pdlfu = if_else(is.nan(pdlfu) | pdlfu < 0, NA_real_, pdlfu)
+  )
+
+# The cascade set below additionally needs a presumptive count and has 61 rows.
+stopifnot(
+  "per-intervention NNS does not run on 64 of 67 interventions" =
+    sum(!is.na(master$nns_af)) == 64
+)
+```
+
+## Project characteristics
+
+Rolls the 67 interventions up to their 35 projects (a flag is "Yes" if any of a project's interventions used it and "No" if none did), then tabulates screening stage, screening point, screening method, testing method and population. This is Table 1 of the manuscript.
+
+Rows within a block are not mutually exclusive and do not sum to 35 or to 100%. Every block has a denominator of 35: the one project whose Subpopulation Detail cell read "N/A" is coded as PDL in the analysis dataset based on the source report.
+
+Writes `data/tbr_project_details.csv` and `output/TableDescriptive.xlsx`.
+
+```{r}
+#| label: project-level-details
+#| include: false
+
+binary_vars <- c(
+  "screening_stage_mass_screening",
+  "screening_stage_entry_screening",
+  "screening_stage_referral_screening",
+  "screening_stage_exit_screening",
+  "screening_point_intake",
+  "screening_point_in_prison",
+  "screening_point_exit",
+  "screening_point_post_prison",
+  "screening_methods_symptom",
+  "screening_methods_cxr",
+  "screening_methods_cxr_ai",
+  "screening_methods_risk_factor",
+  "screening_methods_contact_tracing",
+  "screening_methods_hiv",
+  "testing_methods_genexpert",
+  "testing_methods_culture",
+  "testing_methods_tst",
+  "testing_methods_smear",
+  "subpopulation_prisoners",
+  "subpopulation_ex_prisoners",
+  "subpopulation_staff",
+  "subpopulation_staff_family",
+  "subpopulation_prisoner_family"
+)
+
+# "Yes" if any intervention used it, "No" if none did, NA if never recorded.
+any_yes <- function(x) {
+  if (all(is.na(x))) NA_character_ else if (any(x == 1, na.rm = TRUE)) "Yes" else "No"
+}
+
+# first() collapses these to one value per project; assert they are constant.
+collapsed_vars <- c("country", "who_region", "wave", "year_implemented")
+
+constant_check <- master %>%
+  group_by(project_code) %>%
+  summarise(across(all_of(collapsed_vars), ~ n_distinct(.x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  filter(if_any(all_of(collapsed_vars), ~ .x > 1))
+stopifnot(
+  "a first()-collapsed variable is not constant within project_code" =
+    nrow(constant_check) == 0
+)
+
+project_df <- master %>%
+  group_by(project_code) %>%
+  summarise(
+    year_implemented = first(year_implemented),
+    country          = first(country),
+    who_region       = first(who_region),
+    wave             = first(wave),
+    # As any_yes: NA when the source text was never recorded.
+    subpopulation_other = if (all(is.na(subpopulation_prisoners))) {
+      NA_character_
+    } else if (any(!is.na(subpopulation_other) & subpopulation_other != "")) {
+      "Yes"
+    } else {
+      "No"
+    },
+    across(all_of(binary_vars), any_yes),
+    .groups = "drop"
+  ) %>%
+  mutate(across(c(all_of(binary_vars), subpopulation_other),
+                ~ factor(.x, levels = c("No", "Yes"))))
+
+export(project_df, here("data", "tbr_project_details.csv"))
+```
+
+```{r}
+#| label: project-level-descriptive-table
+#| include: true
+#| echo: true
+
+# One spec per stacked block. value = ~ "Yes" forces one row per flag.
+tbl_specs <- list(
+  list(
+    header = "Screening Stage",
+    labels = list(
+      screening_stage_mass_screening     = "Mass screening",
+      screening_stage_entry_screening    = "Entry screening",
+      screening_stage_referral_screening = "Referral screening",
+      screening_stage_exit_screening     = "Exit screening"
+    )
+  ),
+  list(
+    header = "Screening Point",
+    labels = list(
+      screening_point_intake      = "Intake",
+      screening_point_in_prison   = "In-prison",
+      screening_point_exit        = "Exit",
+      screening_point_post_prison = "Post-prison"
+    )
+  ),
+  list(
+    header = "Screening Methods",
+    labels = list(
+      screening_methods_symptom         = "Symptom",
+      screening_methods_cxr             = "CXR",
+      screening_methods_cxr_ai          = "CXR-AI",
+      screening_methods_risk_factor     = "Risk Factor",
+      screening_methods_contact_tracing = "Contact Tracing",
+      screening_methods_hiv             = "HIV"
+    )
+  ),
+  list(
+    header = "Testing Methods",
+    labels = list(
+      testing_methods_genexpert = "GeneXpert",
+      testing_methods_culture   = "Culture",
+      testing_methods_smear     = "Smear"
+    )
+  ),
+  list(
+    header = "Subpopulation",
+    labels = list(
+      subpopulation_prisoners       = "PDL",
+      subpopulation_ex_prisoners    = "Ex-PDL",
+      subpopulation_staff           = "Staff",
+      subpopulation_staff_family    = "Staff Family",
+      subpopulation_prisoner_family = "PDL Family",
+      subpopulation_other           = "Other"
+    )
+  )
+)
+
+build_block <- function(spec) {
+  vars <- names(spec$labels)
+  project_df %>%
+    tbl_summary(
+      include   = all_of(vars),
+      label     = spec$labels,
+      value     = all_of(vars) ~ "Yes",
+      missing   = "no",
+      statistic = all_categorical() ~ "{n} ({p}%)"
+    )
+}
+
+table_project_caption <-
+  "Characteristics of TB REACH projects conducted in prison from 2011 to 2024"
+
+table_project <- tbl_stack(
+  map(tbl_specs, build_block),
+  group_header = map_chr(tbl_specs, "header")
+) %>%
+  # Indent the flag rows under their block headers.
+  modify_column_indent(columns = label, rows = tbl_id1 >= 1L, indent = 4L) %>%
+  modify_caption(table_project_caption) %>%
+  modify_source_note(sprintf(
+    paste("Unit of analysis: projects (N = %d). A project counts once in a row if",
+          "any of its one or more interventions used that stage, point, method or",
+          "population, so rows are not mutually exclusive and do not sum to %d or",
+          "to 100%%. The %d projects comprise %d distinct interventions."),
+    nrow(project_df), nrow(project_df), nrow(project_df), nrow(master)
+  ))
+
+table_project
+```
+
+```{r}
+#| label: export-descriptive-table
+#| include: false
+
+table_flat <- gtsummary::as_tibble(table_project) %>%
+  rename_with(~ c("group", "characteristic", "n_percent")[seq_along(.x)])
+
+# Use the same XLSX writer as the other exported tables. The pinned openxlsx
+# writer emits dangling drawing references and A1-only worksheet dimensions.
+rio::export(
+  list(TableDescriptive = table_flat, project_details = project_df),
+  here("output", "TableDescriptive.xlsx")
+)
+```
+
+```{r}
+#| label: project-level-text-numbers
+#| include: true
+#| echo: true
+
+# PDL "Yes" and every other population flag "No". The Eswatini project counts:
+# The analysis dataset codes it as PDL based on the source report.
+other_populations <- c("subpopulation_ex_prisoners", "subpopulation_staff",
+                       "subpopulation_staff_family", "subpopulation_prisoner_family",
+                       "subpopulation_other")
+pdl_only <- project_df %>%
+  filter(subpopulation_prisoners == "Yes",
+         if_all(all_of(other_populations), ~ .x == "No"))
+
+text_numbers <- tibble(
+  quantity    = "Projects whose only recorded population is PDL",
+  n           = nrow(pdl_only),
+  denominator = nrow(project_df),
+  percent     = 100 * n / denominator
+)
+
+cat(sprintf("%d of %d projects (%.0f%%) screened people deprived of liberty only.\n",
+            nrow(pdl_only), nrow(project_df), 100 * nrow(pdl_only) / nrow(project_df)))
+```
+
+## Projects by wave
+
+Counts projects, interventions and cascade totals within each TB REACH funding wave. Projects and their main year of implementation (the extraction's `Main Year Implemented` field; the separate range field is not used) come from `project_df`; interventions and counts from `master`. This is Table S1 of the manuscript. The three referral-based interventions (Republic of Moldova, Waves 2 and 4) have no screened count and contribute to the diagnosed columns only.
+
+The table is exported with the other supplementary tables further down.
+
+```{r}
+#| label: wave-table
+#| include: true
+#| echo: true
+
+# Min–max of the projects' main implementation years ("2011–2012", or "2012"
+# when they coincide); the extraction's separate range field is not used. Blank
+# years are ignored.
+year_range <- function(y) {
+  y <- y[!is.na(y)]
+  if (length(y) == 0) return(NA_character_)
+  if (min(y) == max(y)) as.character(min(y)) else paste0(min(y), "–", max(y))
+}
+
+wave_projects <- project_df %>%
+  group_by(wave) %>%
+  summarise(projects = n(),
+            years    = year_range(year_implemented),
+            .groups  = "drop")
+
+wave_interventions <- master %>%
+  group_by(wave) %>%
+  summarise(
+    interventions = n(),
+    n_no_screened = sum(is.na(screened)),
+    screened      = sum(screened, na.rm = TRUE),
+    tb_af         = sum(tb_af, na.rm = TRUE),
+    tb_bplus      = sum(tb_bplus, na.rm = TRUE),
+    .groups       = "drop"
+  )
+
+table_s1_data <- wave_projects %>%
+  full_join(wave_interventions, by = "wave") %>%
+  arrange(wave)
+
+stopifnot(
+  "a wave has projects but no interventions, or the reverse" =
+    !any(is.na(table_s1_data$projects) | is.na(table_s1_data$interventions)),
+  "the wave table does not account for every project and intervention" =
+    sum(table_s1_data$projects) == nrow(project_df) &&
+    sum(table_s1_data$interventions) == nrow(master),
+  "the screened total by wave differs from the pooled denominator" =
+    sum(table_s1_data$screened) == sum(master$screened, na.rm = TRUE),
+  "the interventions without a screened count are not the three expected" =
+    sum(table_s1_data$n_no_screened) == 3
+)
+
+table_s1 <- table_s1_data %>%
+  transmute(
+    Wave                           = as.character(wave),
+    `Main year of implementation`  = years,
+    Projects                       = projects,
+    Interventions                  = interventions,
+    `People screened`              = screened,
+    `People diagnosed (all forms)` = tb_af,
+    `People diagnosed (B+)`        = tb_bplus
+  )
+
+table_s1 <- bind_rows(
+  table_s1,
+  summarise(table_s1,
+            Wave                = "Total",
+            `Main year of implementation` = year_range(project_df$year_implemented),
+            across(where(is.numeric), sum))
+)
+
+no_screened <- master %>%
+  filter(is.na(screened)) %>%
+  distinct(country, wave) %>%
+  mutate(label = sprintf("%s, %s", country, wave)) %>%
+  pull(label)
+
+table_s1_note <- sprintf(
+  "Three interventions (%s) were referral-based and recorded no screened count; they contribute to the diagnosed columns only.",
+  paste(no_screened, collapse = "; ")
+)
+
+table_s1 %>%
+  gt() %>%
+  tab_header(title = "TB REACH projects that screened people deprived of liberty, by funding wave") %>%
+  fmt_integer(columns = where(is.numeric)) %>%
+  tab_footnote(table_s1_note, locations = cells_column_labels(`People screened`)) %>%
+  tab_source_note("Projects and their main year of implementation, as extracted, are counted per project; the remaining columns sum over interventions. B+ = bacteriologically confirmed.")
+```
+
+## Headline estimates
+
+Defines the display and summary helpers used from here on, then reports NNS, NNT and pre-diagnosis loss to follow-up two ways in a single table: the per-intervention distribution (median, IQR, observed range) and the pooled estimate (total screened divided by total cases) with a 95% confidence interval.
+
+The interval is a Wilson score interval on the underlying yield (cases per person screened) inverted end-for-end onto the NNS scale, so the lower NNS bound comes from the upper yield bound.
+
+The two counts on the face of the table differ on purpose. The per-intervention (n) is the number of interventions carrying a value; the pooled (n) is the number carrying both counts, which is 64 of 67. The screened and case totals that the pooled ratio actually used are printed alongside them, so the denominator is never implicit.
+
+```{r}
+#| label: summary-functions
+#| include: false
+
+# NA rather than -Inf/Inf on an all-missing vector. A real Inf passes through.
+safe_min <- function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+safe_max <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+
+# Integer display. Quantiles to the nearest integer; range endpoints rounded up
+# (an NNS of 13.9 means 14 people). Inf prints as "undefined".
+disp <- function(x, rounder) {
+  out <- rep(NA_character_, length(x))
+  finite <- !is.na(x) & is.finite(x)
+  out[finite] <- formatC(rounder(x[finite]), format = "d", big.mark = ",")
+  out[!is.na(x) & is.infinite(x)] <- "undefined"
+  out
+}
+disp_quantile <- function(x) disp(x, round)
+disp_range    <- function(x) disp(x, ceiling)
+
+# Count and proportion display. NA stays NA so gt's sub_missing() can print a dash.
+n_fmt <- function(x) {
+  out <- rep(NA_character_, length(x))
+  ok <- !is.na(x)
+  out[ok] <- formatC(x[ok], format = "d", big.mark = ",")
+  out
+}
+pct_fmt <- function(x, digits = 1) {
+  out <- rep(NA_character_, length(x))
+  ok <- !is.na(x)
+  out[ok] <- sprintf("%.*f%%", digits, 100 * x[ok])
+  out
+}
+
+# Per-intervention distributional summary. n_undefined counts the Inf values.
+estimate <- function(data, var, integer_display = TRUE) {
+  var <- enquo(var)
+  data %>%
+    summarize(
+      Variable      = quo_name(var),
+      Median        = median(!!var, na.rm = TRUE),
+      IQR           = IQR(!!var, na.rm = TRUE),
+      Q1            = quantile(!!var, 0.25, na.rm = TRUE),
+      Q3            = quantile(!!var, 0.75, na.rm = TRUE),
+      Low           = safe_min(!!var),
+      High          = safe_max(!!var),
+      n_non_missing = sum(!is.na(!!var)),
+      n_missing     = sum(is.na(!!var)),
+      n_undefined   = sum(is.infinite(!!var)),
+      count         = n(),
+      .groups       = "drop"
+    ) %>%
+    mutate(
+      # pdlfu is a proportion, not a count.
+      Median_display = if (integer_display) disp_quantile(Median) else NA_character_,
+      Q1_display     = if (integer_display) disp_quantile(Q1)     else NA_character_,
+      Q3_display     = if (integer_display) disp_quantile(Q3)     else NA_character_,
+      Range_display  = if (integer_display) {
+        paste0(disp_range(Low), "–", disp_range(High))
+      } else NA_character_
+    )
+}
+
+# Total screened / total cases over interventions with both recorded, so a
+# zero-case intervention still contributes its screened count. Inf when the
+# stratum found no case; NA when there is nothing to pool.
+pooled_nns <- function(screened, cases) {
+  ok <- !is.na(screened) & !is.na(cases)
+  if (!any(ok)) return(NA_real_)
+  if (sum(screened[ok]) == 0 && sum(cases[ok]) == 0) return(NA_real_)
+  if (sum(cases[ok]) == 0) return(Inf)
+  ceiling(sum(screened[ok]) / sum(cases[ok]))
+}
+
+# Wilson score interval on cases / screened (prop.test without correction),
+# inverted onto the NNS scale.
+pooled_nns_ci <- function(screened, cases) {
+  ok <- !is.na(screened) & !is.na(cases)
+  n <- sum(screened[ok]); x <- sum(cases[ok])
+  if (!any(ok) || n == 0 || x == 0) return(c(NA_real_, NA_real_))
+  ci <- stats::prop.test(x, n, correct = FALSE)$conf.int
+  c(ceiling(1 / ci[2]), ceiling(1 / ci[1]))   # invert: upper yield -> lower NNS
+}
+
+# Pooled estimate, CI and observed range for one grouping variable and one case
+# definition. The pooled set (both counts recorded) is usually smaller than (n),
+# so n_complete_pairs, screened_total and cases_total are reported alongside.
+estimate_weighted <- function(data, vars, numerators) {
+  map_dfr(names(numerators), function(nns_var) {
+    cases_col <- numerators[[nns_var]]
+    map_dfr(vars, function(var) {
+      data %>%
+        filter(!is.na(.data[[var]])) %>%
+        group_by(option_name = as.character(.data[[var]])) %>%
+        summarise(
+          WeightedInvMean = pooled_nns(screened, .data[[cases_col]]),
+          CI_low          = pooled_nns_ci(screened, .data[[cases_col]])[1],
+          CI_high         = pooled_nns_ci(screened, .data[[cases_col]])[2],
+          Low             = safe_min(.data[[nns_var]]),
+          High            = safe_max(.data[[nns_var]]),
+          n_non_missing   = sum(!is.na(.data[[nns_var]])),
+          n_missing       = sum(is.na(.data[[nns_var]])),
+          n_undefined     = sum(is.infinite(.data[[nns_var]])),
+          count           = n(),
+          n_total             = n(),
+          n_complete_pairs    = sum(!is.na(screened) & !is.na(.data[[cases_col]])),
+          n_zero_cases        = sum(.data[[cases_col]] %in% 0),
+          n_missing_screened  = sum(is.na(screened)),
+          screened_total      = sum(screened[!is.na(screened) & !is.na(.data[[cases_col]])]),
+          cases_total         = sum(.data[[cases_col]][!is.na(screened) & !is.na(.data[[cases_col]])]),
+          .groups         = "drop"
+        ) %>%
+        mutate(numerator = nns_var, variable = var, .before = 1)
+    })
+  })
+}
+```
+
+```{r}
+#| label: estimate-tables
+#| include: true
+#| echo: true
+
+pdlfu_NA        <- master %>% filter(is.na(pdlfu))
+pdlfu_morethan0 <- master %>% filter(!is.na(pdlfu), pdlfu != 0)
+
+# People classified presumptive who were never tested, summed over the
+# interventions where the dropout is defined (both counts recorded and tested
+# not above presumptive). The mass-testing designs, which tested more people
+# than they flagged, are outside this denominator by construction.
+pdlfu_defined <- master %>% filter(!is.na(pdlfu))
+text_numbers <- bind_rows(
+  text_numbers,
+  tibble(
+    quantity    = sprintf("People classified presumptive who were never tested (%d interventions with a defined dropout)",
+                          nrow(pdlfu_defined)),
+    n           = sum(pdlfu_defined$presumptive - pdlfu_defined$tested),
+    denominator = sum(pdlfu_defined$presumptive),
+    percent     = 100 * n / denominator
+  )
+)
+
+# Overall pooled NNS with the denominator it actually used.
+pooled_overall <- tibble(
+  Variable  = c("nns_af_wt", "nns_bplus_wt"),
+  cases_col = c("tb_af", "tb_bplus"),
+  nns_col   = c("nns_af", "nns_bplus")
+) %>%
+  rowwise() %>%
+  mutate(
+    WeightedInvMean    = pooled_nns(master$screened, master[[cases_col]]),
+    CI_low             = pooled_nns_ci(master$screened, master[[cases_col]])[1],
+    CI_high            = pooled_nns_ci(master$screened, master[[cases_col]])[2],
+    Low                = safe_min(master[[nns_col]]),
+    High               = safe_max(master[[nns_col]]),
+    n_non_missing      = sum(!is.na(master[[nns_col]])),
+    n_missing          = sum(is.na(master[[nns_col]])),
+    n_undefined        = sum(is.infinite(master[[nns_col]])),
+    count              = nrow(master),
+    n_total            = nrow(master),
+    n_complete_pairs   = sum(!is.na(master$screened) & !is.na(master[[cases_col]])),
+    n_zero_cases       = sum(master[[cases_col]] %in% 0),
+    n_missing_screened = sum(is.na(master$screened)),
+    screened_total     = sum(master$screened[!is.na(master$screened) & !is.na(master[[cases_col]])]),
+    cases_total        = sum(master[[cases_col]][!is.na(master$screened) & !is.na(master[[cases_col]])])
+  ) %>%
+  ungroup() %>%
+  select(-cases_col, -nns_col) %>%
+  mutate(Range_display = paste0(disp_range(Low), "–", disp_range(High)))
+
+estimate_summary <- bind_rows(
+  estimate(master, pdlfu, integer_display = FALSE),
+  estimate(master, nnt_af),
+  estimate(master, nnt_bplus),
+  estimate(master, nns_af),
+  estimate(master, nns_bplus)
+) %>%
+  bind_rows(pooled_overall)
+
+# Presentation copy; estimate_summary stays numeric for the figures and workbook.
+measure_labels <- c(
+  pdlfu        = "Pre-diagnosis loss to follow-up",
+  nnt_af       = "NNT, all forms",
+  nnt_bplus    = "NNT, bacteriologically confirmed",
+  nns_af       = "NNS, all forms",
+  nns_bplus    = "NNS, bacteriologically confirmed",
+  nns_af_wt    = "NNS, all forms",
+  nns_bplus_wt = "NNS, bacteriologically confirmed"
+)
+
+estimate_display <- estimate_summary %>%
+  mutate(
+    is_pooled = str_detect(Variable, "_wt$"),
+    is_prop   = Variable == "pdlfu",
+    Block = if_else(
+      is_pooled,
+      "Pooled across interventions (ratio of totals)",
+      "Per-intervention distribution"
+    ),
+    Measure = unname(measure_labels[Variable]),
+    # A pooled n is the number with both counts recorded.
+    n_shown = if_else(is_pooled, n_complete_pairs, n_non_missing),
+    `Median (IQR)` = case_when(
+      is_pooled ~ NA_character_,
+      is_prop   ~ sprintf("%s (%s–%s)", pct_fmt(Median), pct_fmt(Q1), pct_fmt(Q3)),
+      TRUE      ~ sprintf("%s (%s–%s)", Median_display, Q1_display, Q3_display)
+    ),
+    `Observed range` = if_else(
+      is_prop,
+      sprintf("%s–%s", pct_fmt(Low), pct_fmt(High)),
+      Range_display
+    ),
+    `Pooled estimate (95% CI)` = if_else(
+      is.na(WeightedInvMean), NA_character_,
+      sprintf("%s (%s–%s)", disp_range(WeightedInvMean),
+              n_fmt(CI_low), n_fmt(CI_high))
+    ),
+    Screened = n_fmt(screened_total),
+    Cases    = n_fmt(cases_total)
+  ) %>%
+  select(Block, Measure, n = n_shown, Undefined = n_undefined,
+         `Median (IQR)`, `Observed range`, `Pooled estimate (95% CI)`,
+         Screened, Cases)
+
+stopifnot("a measure has no display label" = !any(is.na(estimate_display$Measure)))
+
+table_estimates <- estimate_display %>%
+  gt(groupname_col = "Block", rowname_col = "Measure") %>%
+  tab_header(
+    title = "Number needed to screen, number needed to test, and pre-diagnosis loss to follow-up"
+  ) %>%
+  cols_align("center", columns = -c(n, Undefined)) %>%
+  cols_align("right", columns = c(n, Undefined)) %>%
+  sub_missing(columns = everything(), missing_text = "—") %>%
+  tab_footnote(
+    "Interventions contributing. For a pooled estimate this is the number with both a screened count and a case count recorded, which is 64 of 67: three interventions were referral-based and screened no population.",
+    locations = cells_column_labels(n)
+  ) %>%
+  tab_footnote(
+    "Interventions that screened people and found no one with TB. Their ratio is undefined rather than missing, so they are counted here and kept in every summary.",
+    locations = cells_column_labels(Undefined)
+  ) %>%
+  tab_footnote(
+    "Median and interquartile range (Q1–Q3), rounded to the nearest whole person. Pre-diagnosis loss to follow-up is a proportion of those classified presumptive and is shown as a percentage to one decimal place.",
+    locations = cells_column_labels(`Median (IQR)`)
+  ) %>%
+  tab_footnote(
+    "Smallest and largest per-intervention value, rounded up: an NNS of 13.9 means 14 people must be screened to expect one case. \"undefined\" is the upper end of a range that contains an intervention that found no one with TB.",
+    locations = cells_column_labels(`Observed range`)
+  ) %>%
+  tab_footnote(
+    "Total screened divided by total cases, with a 95% Wilson score interval on the underlying yield inverted onto the NNS scale.",
+    locations = cells_column_labels(`Pooled estimate (95% CI)`)
+  ) %>%
+  tab_source_note(sprintf(
+    "Unit of analysis: interventions (N = %d) across %d projects. NNS = number needed to screen; NNT = number needed to test; B+ = bacteriologically confirmed.",
+    nrow(master), nrow(project_df)
+  ))
+
+table_estimates
+```
+
+## Estimates by screening point, method and population
+
+Recodes screening point onto a single ordered factor and composes combination labels for screening method and population out of the underlying flags, so an intervention that used both symptom screening and chest X-ray reads as "Symptom, CXR" and enters the table once.
+
+The pooled NNS is then computed within each option of the three groupings, for both case definitions side by side. Screening point, method and population are recorded per intervention and are not mutually exclusive across groupings, so an intervention appears once in each of the three blocks and the blocks are not additive.
+
+```{r}
+#| label: new-categories
+#| include: false
+
+n_missing_point_before <- sum(is.na(master$screening_point))
+
+master <- master %>%
+  mutate(
+    screening_point = recode(
+      screening_point,
+      "In-prison"                        = "In Prison",
+      "Intake"                           = "Intake",
+      "Exit"                             = "Exit",
+      "Post-prison"                      = "Post Prison",
+      "Detention-associated environment" = "Detention Associated Environment",
+      "Intake, In-prison"                = "Intake; In Prison",
+      "Intake and In-prison"             = "Intake; In Prison",
+      "In-prison, Post-prison"           = "In Prison; Post Prison",
+      "Intake, In-prison, Exit"          = "Intake; In Prison; Exit"
+    ),
+    screening_point = factor(
+      screening_point,
+      levels = c(
+        "Intake", "In Prison", "Exit", "Post Prison",
+        "Detention Associated Environment", "Intake; In Prison",
+        "In Prison; Post Prison", "Intake; In Prison; Exit"
+      )
+    )
+  )
+
+# A value not covered by the recode would become NA and drop out silently.
+stopifnot(
+  "a screening_point value is not covered by the recode/factor levels" =
+    sum(is.na(master$screening_point)) == n_missing_point_before
+)
+
+# Combination label from 0/1 flags. NA flags count as not used; all-zero gives NA.
+combine_flags <- function(df, cols, labels) {
+  m <- as.matrix(df[cols])
+  m[is.na(m)] <- 0
+  out <- apply(m, 1, function(r) paste(labels[r == 1], collapse = ", "))
+  na_if(out, "")
+}
+
+master <- master %>%
+  mutate(
+    cxr = pmax(screening_methods_cxr, screening_methods_cxr_ai, na.rm = TRUE),
+    other_ind = if_else(
+      !is.na(subpopulation_other) &
+        !(str_trim(as.character(subpopulation_other)) %in% c("", "0")),
+      1L, 0L
+    )
+  )
+
+master$screening_method <- combine_flags(
+  master,
+  c("screening_methods_symptom", "cxr", "screening_methods_risk_factor",
+    "screening_methods_contact_tracing", "screening_methods_hiv"),
+  c("Symptom", "CXR", "Risk factor", "Contact tracing", "HIV")
+)
+
+master$subpopulation <- combine_flags(
+  master,
+  c("subpopulation_prisoners", "subpopulation_ex_prisoners",
+    "subpopulation_staff", "subpopulation_staff_family",
+    "subpopulation_prisoner_family", "other_ind"),
+  c("PDL", "Ex-PDL", "Staff", "Staff family", "PDL family", "Other")
+)
+
+# Singles first, then combinations by number of components.
+method_levels <- master %>%
+  distinct(screening_method) %>%
+  filter(!is.na(screening_method)) %>%
+  arrange(str_count(screening_method, ","), screening_method) %>%
+  pull(screening_method)
+
+single_levels <- c("PDL", "Ex-PDL", "Staff", "Staff family", "PDL family", "Other")
+
+master <- master %>%
+  mutate(
+    screening_method = factor(screening_method, levels = method_levels),
+    subpopulation    = factor(subpopulation),
+    # Only the singles that occur; naming an absent level warns.
+    subpopulation    = fct_relevel(
+      subpopulation,
+      intersect(single_levels, levels(subpopulation)),
+      after = 0
+    )
+  )
+```
+
+### Screening method by testing method
+
+Cross-tabulates the screening-method combination against the testing-method combination at the intervention level (N = 67), as Table S3 of the manuscript. The testing combination is built with the same `combine_flags()` over sputum smear microscopy, GeneXpert and culture. One intervention (Brazil, Wave 4) recorded no testing method and is shown as "Not recorded". Tuberculin skin testing is left out because it tests for infection, not disease.
+
+```{r}
+#| label: methods-crosstab
+#| include: true
+#| echo: true
+
+master$testing_method <- combine_flags(
+  master,
+  c("testing_methods_smear", "testing_methods_genexpert", "testing_methods_culture"),
+  c("Smear", "Xpert", "Culture")
+)
+
+# Singles first, then combinations; "Not recorded" last.
+testing_levels <- master %>%
+  distinct(testing_method) %>%
+  filter(!is.na(testing_method)) %>%
+  arrange(str_count(testing_method, ","), testing_method) %>%
+  pull(testing_method)
+
+master <- master %>%
+  mutate(testing_method = factor(replace_na(testing_method, "Not recorded"),
+                                 levels = c(testing_levels, "Not recorded")))
+
+stopifnot(
+  "every intervention should have a screening-method combination" =
+    !any(is.na(master$screening_method)),
+  "expected exactly one intervention without a recorded testing method" =
+    sum(master$testing_method == "Not recorded") == 1
+)
+
+table_s3 <- master %>%
+  count(screening_method, testing_method, .drop = FALSE) %>%
+  pivot_wider(names_from = testing_method, values_from = n, values_fill = 0) %>%
+  mutate(`Screening method` = as.character(screening_method),
+         .keep = "unused", .before = 1) %>%
+  mutate(Total = rowSums(across(where(is.numeric))))
+
+table_s3 <- bind_rows(
+  table_s3,
+  summarise(table_s3, `Screening method` = "Total", across(where(is.numeric), sum))
+)
+
+stopifnot(
+  "the cross-tabulation does not account for every intervention" =
+    table_s3$Total[table_s3$`Screening method` == "Total"] == nrow(master)
+)
+
+table_s3 %>%
+  gt(rowname_col = "Screening method") %>%
+  tab_header(title = "Screening method by testing method, number of interventions") %>%
+  tab_spanner(label = "Testing method", columns = -Total) %>%
+  tab_source_note("Unit of analysis: interventions (N = 67). A combination lists every method the intervention used.")
+```
+
+```{r}
+#| label: weighted-estimates
+#| include: true
+#| echo: true
+
+weighted_summary <- estimate_weighted(
+  master,
+  vars       = c("screening_point", "screening_method", "subpopulation"),
+  numerators = list(nns_af = "tb_af", nns_bplus = "tb_bplus")
+)
+
+data_labeled <- weighted_summary %>%
+  mutate(
+    variable = factor(variable,
+                      levels = c("screening_point", "screening_method", "subpopulation"),
+                      labels = c("Screening point", "Screening method", "Subpopulation")),
+    # Range endpoints rounded up; a zero-case group prints "undefined" as its maximum.
+    pooled_display = disp_range(WeightedInvMean),
+    est.lab = case_when(
+      is.na(WeightedInvMean)   ~ NA_character_,
+      count == 1               ~ pooled_display,
+      is.na(Low) | is.na(High) ~ pooled_display,
+      TRUE ~ sprintf("%s (%s, %s)", pooled_display,
+                     disp_range(Low), disp_range(High))
+    ),
+    # est.lab with an en dash, for the figure.
+    est_fig = case_when(
+      is.na(WeightedInvMean)   ~ NA_character_,
+      count == 1               ~ pooled_display,
+      is.na(Low) | is.na(High) ~ pooled_display,
+      TRUE ~ sprintf("%s (%s–%s)", pooled_display,
+                     disp_range(Low), disp_range(High))
+    ),
+    # n on the figure counts the interventions that contribute to the point and
+    # the bar (a screened count and a case count), not the group's membership.
+    option_label = sprintf("%s (n=%d)", option_name, n_non_missing)
+  )
+
+# One row per option, both case definitions side by side, in factor-level order.
+group_vars <- c("Screening point"  = "screening_point",
+                "Screening method" = "screening_method",
+                "Subpopulation"    = "subpopulation")
+
+option_order <- imap_dfr(group_vars, function(raw, lab) {
+  tibble(variable     = lab,
+         option_name  = levels(master[[raw]]),
+         option_order = seq_along(levels(master[[raw]])))
+})
+
+# An option that is not a level of its source factor would sort to the end.
+stopifnot(
+  "an option in the estimates is not a level of its source factor" =
+    nrow(anti_join(
+      distinct(mutate(data_labeled, variable = as.character(variable)),
+               variable, option_name),
+      option_order, by = c("variable", "option_name")
+    )) == 0
+)
+
+pooled_long <- data_labeled %>%
+  mutate(
+    variable   = as.character(variable),
+    pooled_ci  = if_else(
+      is.na(WeightedInvMean), NA_character_,
+      sprintf("%s (%s–%s)", disp_range(WeightedInvMean),
+              n_fmt(CI_low), n_fmt(CI_high))
+    ),
+    range_disp = sprintf("%s–%s", disp_range(Low), disp_range(High)),
+    arm        = if_else(numerator == "nns_af", "af", "bplus")
+  ) %>%
+  select(variable, option_name, count, screened_total, cases_total,
+         arm, pooled_ci, range_disp)
+
+# screened does not depend on the case definition, so it is carried as an id column.
+stopifnot(
+  "the screened denominator differs by case definition" =
+    pooled_long %>%
+      group_by(variable, option_name) %>%
+      summarise(k = n_distinct(screened_total), .groups = "drop") %>%
+      pull(k) %>% max() == 1
+)
+
+pooled_group_display <- pooled_long %>%
+  pivot_wider(names_from  = arm,
+              values_from = c(cases_total, pooled_ci, range_disp)) %>%
+  left_join(option_order, by = c("variable", "option_name")) %>%
+  arrange(match(variable, names(group_vars)), option_order) %>%
+  transmute(
+    Group      = variable,
+    Option     = option_name,
+    n          = count,
+    Screened   = n_fmt(screened_total),
+    cases_af   = n_fmt(cases_total_af),
+    nns_af     = pooled_ci_af,
+    range_af   = range_disp_af,
+    cases_bp   = n_fmt(cases_total_bplus),
+    nns_bp     = pooled_ci_bplus,
+    range_bp   = range_disp_bplus
+  )
+
+table_pooled <- pooled_group_display %>%
+  gt(groupname_col = "Group", rowname_col = "Option") %>%
+  tab_header(title = "Pooled number needed to screen, by screening point, screening method and subpopulation") %>%
+  tab_spanner("All forms", columns = c(cases_af, nns_af, range_af)) %>%
+  tab_spanner("Bacteriologically confirmed", columns = c(cases_bp, nns_bp, range_bp)) %>%
+  cols_label(
+    n        = "Interventions",
+    Screened = "Screened",
+    cases_af = "Cases", nns_af = "Pooled NNS (95% CI)", range_af = "Observed range",
+    cases_bp = "Cases", nns_bp = "Pooled NNS (95% CI)", range_bp = "Observed range"
+  ) %>%
+  cols_align("right", columns = c(n, Screened, cases_af, cases_bp)) %>%
+  cols_align("center", columns = c(nns_af, range_af, nns_bp, range_bp)) %>%
+  sub_missing(columns = everything(), missing_text = "—") %>%
+  tab_footnote(
+    "Total screened divided by total cases within the group, with a 95% Wilson score interval on the underlying yield inverted onto the NNS scale.",
+    locations = cells_column_labels(c(nns_af, nns_bp))
+  ) %>%
+  tab_footnote(
+    "Smallest and largest per-intervention NNS in the group, rounded up. \"undefined\" means the group contains an intervention that screened people and found no one with TB.",
+    locations = cells_column_labels(c(range_af, range_bp))
+  ) %>%
+  tab_source_note(
+    "Unit of analysis: interventions. Screening point, screening method and subpopulation are recorded per intervention and are not mutually exclusive across groups, so an intervention appears once in each of the three blocks. NNS = number needed to screen."
+  )
+
+table_pooled
+```
+
+## Three-level random-effects model
+
+A sensitivity analysis for the pooled NNS. The pooled ratio counts every intervention in proportion to how many people it screened, so the largest interventions dominate it, and its Wilson interval carries only binomial sampling error. The three-level random-effects model is a binomial generalised linear mixed model (`lme4::glmer`, Laplace approximation) with random intercepts for project and for intervention within project: it models the binomial counts while allowing variation between projects and between interventions within projects. Its NNS is `1 / plogis(fixed intercept)`, the inverse yield at zero project and intervention random effects, rather than a yield averaged over the random-effects distribution. The 95% Wald CI for the fixed intercept is transformed to yield, inverted end-for-end and rounded up like every other NNS in this document. See the [lme4 model documentation](https://lme4.github.io/lme4/reference/glmer.html) for the conditional mean and Laplace approximation. Fitted on the 64 interventions with a screened count (32 projects); an intervention that found no one with TB contributes its screened count without a continuity correction.
+
+Table S2 of the manuscript sets the per-intervention distribution, the pooled NNS and the random-effects NNS side by side, with the two variance components.
+
+```{r}
+#| label: random-effects
+#| include: true
+#| echo: true
+
+library(lme4)
+
+re_data <- master %>%
+  filter(!is.na(screened), screened > 0) %>%
+  mutate(project_code = factor(project_code), intervention_id = factor(intervention_id))
+
+stopifnot(
+  "the random-effects set is not the 64 interventions from 32 projects" =
+    nrow(re_data) == 64 && n_distinct(re_data$project_code) == 32
+)
+
+fit_three_level <- function(cases_col) {
+  d <- re_data %>%
+    transmute(project_code, intervention_id, screened, cases = .data[[cases_col]])
+  stopifnot("a case count is missing or exceeds the screened count" =
+              all(!is.na(d$cases) & d$cases <= d$screened))
+  fit <- glmer(cbind(cases, screened - cases) ~ 1 + (1 | project_code / intervention_id),
+               data = d, family = binomial, nAGQ = 1L, na.action = na.fail)
+  beta <- unname(fixef(fit)[["(Intercept)"]])
+  se   <- sqrt(as.numeric(vcov(fit)[1, 1]))
+  vc   <- as.data.frame(VarCorr(fit))
+  tibble(
+    cases_col        = cases_col,
+    yield            = plogis(beta),
+    nns              = 1 / plogis(beta),
+    nns_low          = 1 / plogis(beta + 1.96 * se),   # upper yield -> lower NNS
+    nns_high         = 1 / plogis(beta - 1.96 * se),
+    var_project      = vc$vcov[vc$grp == "project_code"],
+    var_intervention = vc$vcov[vc$grp == "intervention_id:project_code"],
+    n                = nrow(d),
+    n_projects       = n_distinct(d$project_code),
+    converged        = all(fit@optinfo$conv$opt == 0) &&
+                         length(fit@optinfo$conv$lme4$messages) == 0,
+    singular         = isSingular(fit)
+  )
+}
+
+re_summary <- bind_rows(fit_three_level("tb_af"), fit_three_level("tb_bplus"))
+
+stopifnot(
+  "the three-level model reported a convergence problem" = all(re_summary$converged),
+  "the three-level model has a singular fit" = !any(re_summary$singular),
+  "a variance component is missing" =
+    !any(is.na(re_summary$var_project) | is.na(re_summary$var_intervention))
+)
+
+# One column of Table S2: the three estimates and the two variance components.
+s2_column <- function(nns_var, wt_var, re_row) {
+  per  <- estimate_summary %>% filter(Variable == nns_var)
+  pool <- estimate_summary %>% filter(Variable == wt_var)
+  stopifnot("Table S2 needs exactly one row per estimate" = nrow(per) == 1 && nrow(pool) == 1)
+  c(
+    sprintf("%s (%s–%s)", per$Median_display, per$Q1_display, per$Q3_display),
+    sprintf("%s (%s–%s)", disp_range(pool$WeightedInvMean), n_fmt(pool$CI_low), n_fmt(pool$CI_high)),
+    sprintf("%s (%s–%s)", disp_range(re_row$nns), disp_range(re_row$nns_low), disp_range(re_row$nns_high)),
+    sprintf("%.2f", re_row$var_project),
+    sprintf("%.2f", re_row$var_intervention)
+  )
+}
+
+table_s2 <- tibble(
+  Estimate = c(
+    "Per-intervention NNS, median (IQR)",
+    "Pooled NNS, total screened / total diagnosed (95% Wilson CI)",
+    "Three-level random-effects NNS (95% CI)",
+    "Variance between projects (logit scale)",
+    "Variance between interventions within project (logit scale)"
+  ),
+  `All forms` = s2_column("nns_af", "nns_af_wt", re_summary[re_summary$cases_col == "tb_af", ]),
+  `B+`        = s2_column("nns_bplus", "nns_bplus_wt", re_summary[re_summary$cases_col == "tb_bplus", ])
+)
+
+table_s2 %>%
+  gt(rowname_col = "Estimate") %>%
+  tab_header(title = "Number needed to screen: per-intervention, pooled and random-effects estimates") %>%
+  tab_source_note(sprintf(
+    paste("%d interventions from %d projects with a screened count. The random-effects",
+          "estimate is from a binomial generalised linear mixed model with random intercepts",
+          "for project and for intervention within project; its NNS is the inverse of the",
+          "yield at zero random effects, with an inverted 95%% Wald CI for the fixed intercept. B+ = bacteriologically confirmed."),
+    re_summary$n[1], re_summary$n_projects[1]))
+```
+
+## Numbers for the Results prose
+
+Collects the quantities the manuscript quotes that are not cells of a table, beyond the two computed with the headline estimates: the interventions with and without a testing dropout, the cascade totals over the 64 interventions with a screened count, the interventions that tested beyond the presumptive group or combined screening points, the range of the breadth of screen, the extremes of the pooled NNS within each grouping of Figures 2 and 3, and the random-effects NNS.
+
+```{r}
+#| label: text-numbers-v6
+#| include: false
+
+lab_int <- function(d) sprintf("%s (%s)", d$country, d$intervention_id)
+
+# (a) to (c): the testing dropout where it is defined.
+dropout_zero <- pdlfu_defined %>% filter(pdlfu == 0)
+dropout_some <- pdlfu_defined %>% filter(pdlfu > 0)
+dropout_high <- dropout_some %>% filter(pdlfu > 0.30)
+
+# (d) cascade totals over the interventions with a screened count.
+screened_set <- master %>% filter(!is.na(screened))
+
+# (e) tested beyond the presumptive group; (f) combined screening points.
+tested_beyond   <- master %>% filter(!is.na(presumptive), !is.na(tested), tested > presumptive)
+combined_points <- master %>% filter(str_detect(as.character(screening_point), ";"))
+
+# (g) breadth of screen: undefined (Inf) where no one was classified presumptive.
+breadth <- screened_set %>%
+  filter(!is.na(presumptive)) %>%
+  mutate(breadth = count_ratio(screened, presumptive))
+breadth_finite    <- breadth %>% filter(is.finite(breadth))
+breadth_undefined <- breadth %>% filter(!is.finite(breadth))
+
+# (h) lowest and highest pooled NNS within each grouping of Figures 2 and 3.
+nns_extremes <- data_labeled %>%
+  filter(is.finite(WeightedInvMean)) %>%
+  group_by(numerator, variable) %>%
+  slice(c(which.min(WeightedInvMean), which.max(WeightedInvMean))) %>%
+  mutate(end = c("Lowest", "Highest")) %>%
+  ungroup()
+
+text_numbers <- bind_rows(
+  text_numbers,
+  tibble(
+    quantity    = "Interventions with a defined dropout in which everyone classified presumptive was tested",
+    n           = nrow(dropout_zero),
+    denominator = nrow(pdlfu_defined),
+    percent     = 100 * n / denominator
+  ),
+  tibble(
+    quantity    = "Interventions with a defined dropout in which some people classified presumptive were not tested",
+    n           = nrow(dropout_some),
+    denominator = nrow(pdlfu_defined),
+    percent     = 100 * n / denominator,
+    detail      = sprintf("untested share: median %s, IQR %s–%s",
+                          pct_fmt(median(dropout_some$pdlfu)),
+                          pct_fmt(quantile(dropout_some$pdlfu, 0.25)),
+                          pct_fmt(quantile(dropout_some$pdlfu, 0.75)))
+  ),
+  tibble(
+    quantity    = "Interventions in which more than 30% of people classified presumptive were not tested",
+    n           = nrow(dropout_high),
+    denominator = nrow(pdlfu_defined),
+    percent     = 100 * n / denominator,
+    detail      = paste(sprintf("%s %s", lab_int(dropout_high), pct_fmt(dropout_high$pdlfu)),
+                        collapse = "; ")
+  ),
+  tibble(
+    quantity    = sprintf("People classified presumptive over the %d interventions with a screened count (%d with a presumptive count)",
+                          nrow(screened_set), sum(!is.na(screened_set$presumptive))),
+    n           = sum(screened_set$presumptive, na.rm = TRUE)
+  ),
+  tibble(
+    quantity    = sprintf("People tested over the %d interventions with a screened count (%d with a tested count)",
+                          nrow(screened_set), sum(!is.na(screened_set$tested))),
+    n           = sum(screened_set$tested, na.rm = TRUE)
+  ),
+  tibble(
+    quantity    = "Interventions that tested more people than they classified presumptive",
+    n           = nrow(tested_beyond),
+    detail      = paste(lab_int(tested_beyond), collapse = "; ")
+  ),
+  tibble(
+    quantity    = "Interventions recorded with a combined screening point",
+    n           = nrow(combined_points),
+    detail      = paste(sprintf("%s: %s", lab_int(combined_points), combined_points$screening_point),
+                        collapse = "; ")
+  ),
+  tibble(
+    quantity    = "Breadth of screen (people screened per person classified presumptive): interventions with a finite value",
+    n           = nrow(breadth_finite),
+    detail      = sprintf("lowest %.1f (%s), highest %.1f (%s); undefined (no one classified presumptive) in %s",
+                          min(breadth_finite$breadth),
+                          lab_int(slice_min(breadth_finite, breadth, n = 1, with_ties = FALSE)),
+                          max(breadth_finite$breadth),
+                          lab_int(slice_max(breadth_finite, breadth, n = 1, with_ties = FALSE)),
+                          paste(lab_int(breadth_undefined), collapse = "; "))
+  ),
+  nns_extremes %>%
+    transmute(
+      quantity = sprintf("%s pooled NNS by %s, %s", end, tolower(as.character(variable)),
+                         if_else(numerator == "nns_af", "all forms", "bacteriologically confirmed")),
+      n        = WeightedInvMean,
+      detail   = sprintf("%s (n=%d): 95%% CI %s–%s; screened %s, cases %s",
+                         option_name, count, n_fmt(CI_low), n_fmt(CI_high),
+                         n_fmt(screened_total), n_fmt(cases_total))
+    ),
+  re_summary %>%
+    transmute(
+      quantity = sprintf("Three-level random-effects NNS, %s",
+                         if_else(cases_col == "tb_af", "all forms", "bacteriologically confirmed")),
+      n        = ceiling(nns),
+      detail   = sprintf("95%% CI %s–%s; yield %.3f%%; variance between projects %.2f, between interventions within project %.2f",
+                         disp_range(nns_low), disp_range(nns_high), 100 * yield,
+                         var_project, var_intervention)
+    )
+)
+```
+
+```{r}
+#| label: text-numbers-v8
+#| include: false
+
+# (i) The per-intervention median NNS within each option of Figures 2 and 3,
+# so the prose can set a pooled contrast beside the typical intervention.
+# (j) The largest intervention's share of the people screened in each option,
+# which is what carries a pooled contrast when it exceeds a half.
+option_long <- master %>%
+  select(intervention_id, country, screened, nns_af, nns_bplus,
+         screening_point, screening_method, subpopulation) %>%
+  mutate(across(c(screening_point, screening_method, subpopulation), as.character)) %>%
+  pivot_longer(c(screening_point, screening_method, subpopulation),
+               names_to = "variable", values_to = "option_name") %>%
+  filter(!is.na(option_name)) %>%
+  mutate(variable = str_replace_all(variable, "_", " "))
+
+option_medians <- option_long %>%
+  group_by(variable, option_name) %>%
+  summarise(
+    n_nns        = sum(!is.na(nns_af)),
+    median_af    = median(nns_af, na.rm = TRUE),
+    median_bplus = median(nns_bplus, na.rm = TRUE),
+    .groups      = "drop"
+  ) %>%
+  filter(n_nns > 0)
+
+option_dominance <- option_long %>%
+  filter(!is.na(screened)) %>%
+  group_by(variable, option_name) %>%
+  mutate(share = screened / sum(screened), n_screened = n()) %>%
+  slice_max(share, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+stopifnot(
+  "an option has a median but no dominance row, or the reverse" =
+    setequal(paste(option_medians$variable, option_medians$option_name),
+             paste(option_dominance$variable, option_dominance$option_name))
+)
+
+text_numbers <- bind_rows(
+  text_numbers,
+  option_medians %>%
+    transmute(
+      quantity = sprintf("Per-intervention median NNS by %s: %s, all forms", variable, option_name),
+      n        = median_af,
+      detail   = sprintf("median over %d interventions with an NNS; displays as %s", n_nns, disp_quantile(median_af))
+    ),
+  option_medians %>%
+    transmute(
+      quantity = sprintf("Per-intervention median NNS by %s: %s, bacteriologically confirmed", variable, option_name),
+      n        = median_bplus,
+      detail   = sprintf("median over %d interventions with an NNS; displays as %s", n_nns, disp_quantile(median_bplus))
+    ),
+  option_dominance %>%
+    transmute(
+      quantity    = sprintf("Largest intervention's share of people screened by %s: %s", variable, option_name),
+      n           = screened,
+      denominator = round(screened / share),
+      percent     = 100 * share,
+      detail      = sprintf("%s, %d interventions with a screened count", lab_int(option_dominance)[row_number()], n_screened)
+    )
+)
+```
+
+```{r}
+#| label: text-numbers
+#| include: true
+#| echo: true
+
+text_numbers %>%
+  mutate(percent = if_else(is.na(percent), NA_character_, sprintf("%.1f%%", percent))) %>%
+  gt() %>%
+  tab_header(title = "Numbers quoted in the Results prose that are not cells of a table") %>%
+  cols_label(quantity = "Quantity", n = "n", denominator = "Denominator",
+             percent = "Percent", detail = "Detail") %>%
+  fmt_integer(columns = c(n, denominator)) %>%
+  sub_missing(columns = everything(), missing_text = "—")
+```
+
+```{r}
+#| label: export-estimates
+#| include: false
+
+# Internal workbook: pdlfu_morethan0 and pdlfu_NA carry project codes and
+# verbatim free text from the extraction.
+readme <- tibble(
+  Sheet = c("(all)", "Table_estimates", "Table_pooled_by_group",
+            "estimate_summary", "pooled_by_group", "text_numbers",
+            "pdlfu_morethan0", "pdlfu_NA"),
+  Notes = c(
+    "INTERNAL: contains project codes and verbatim free text from the extraction. Do not share outside the team.",
+    "The formatted estimates table as it appears in the report: one row per measure, with the quantile summary, the observed range and the pooled estimate already composed as text.",
+    "The formatted pooled-by-group table as it appears in the report: one row per group option, with both case definitions side by side.",
+    "Per-intervention distributional summaries and the overall pooled NNS, unformatted. 'undefined' = an intervention screened people and found no cases, so its NNS is infinite; such interventions are counted, never dropped. Median/Q1/Q3 displays are rounded to the nearest integer; range endpoints are rounded up.",
+    "Pooled NNS by group, unformatted, with a 95% Wilson score interval on the underlying yield inverted to NNS, the observed per-intervention range, and the denominator disclosure columns (n_complete_pairs, screened_total, cases_total).",
+    "Numbers quoted in the Results prose that are not cells of a table: the PDL-only project count, the untested share and its distribution, cascade totals over the 64 interventions with a screened count, the interventions that tested beyond the presumptive group or combined screening points, the breadth-of-screen range, the extremes of the pooled NNS by group, the three-level random-effects NNS, and, for every option of Figures 2 and 3, the per-intervention median NNS and the largest intervention's share of the people screened.",
+    "Interventions with a non-zero pre-diagnosis cascade dropout.",
+    "Interventions where the cascade dropout could not be computed."
+  )
+)
+
+# Formatted tables first, the numeric frames behind them after.
+table_estimates_flat <- estimate_display %>%
+  rename(`Interventions (n)` = n, `Undefined (n)` = Undefined,
+         `Screened (pooled)` = Screened, `Cases (pooled)` = Cases)
+
+table_pooled_flat <- pooled_group_display %>%
+  rename(`Interventions (n)`                 = n,
+         `All forms: cases`                  = cases_af,
+         `All forms: pooled NNS (95% CI)`    = nns_af,
+         `All forms: observed range`         = range_af,
+         `B+: cases`                         = cases_bp,
+         `B+: pooled NNS (95% CI)`           = nns_bp,
+         `B+: observed range`                = range_bp)
+
+rio::export(
+  list(
+    README                = readme,
+    Table_estimates       = table_estimates_flat,
+    Table_pooled_by_group = table_pooled_flat,
+    estimate_summary      = estimate_summary,
+    pooled_by_group       = data_labeled,
+    text_numbers          = text_numbers,
+    pdlfu_morethan0       = pdlfu_morethan0,
+    pdlfu_NA              = pdlfu_NA
+  ),
+  here("output", "estimate_summary.xlsx")
+)
+```
+
+```{r}
+#| label: export-supplementary
+#| include: false
+
+# Supplementary tables S1 to S3 as they appear in Additional File 1.
+rio::export(
+  list(
+    README = tibble(
+      Sheet = c("Table_S1_waves", "Table_S2_nns_models", "Table_S3_methods_crosstab"),
+      Notes = c(
+        "Projects, interventions and cascade totals by TB REACH funding wave. Projects and years are counted per project; the other columns sum over interventions. Three referral-based interventions have no screened count.",
+        "Per-intervention distribution, pooled ratio and three-level random-effects NNS side by side, with the variance components of the random-effects model on the logit scale.",
+        "Screening-method combination by testing-method combination, counts of interventions (N = 67)."
+      )
+    ),
+    Table_S1_waves            = table_s1,
+    Table_S2_nns_models       = table_s2,
+    Table_S3_methods_crosstab = table_s3
+  ),
+  here("output", "supplementary_tables.xlsx")
+)
+```
+
+## NNS forest figures
+
+One figure per case definition: pooled NNS by screening point, screening method and subpopulation, on a log axis. `Figure_pooled_nns_af` is Figure 2 of the manuscript and `Figure_pooled_nns_bplus` is Figure 3. The title and legend of every figure from here on are held in this document, worded as in the manuscript, so each image file carries the plot alone.
+
+**Figure 2: Pooled number needed to screen (NNS) for all forms of TB.** Forest plot detailing the pooled number needed to screen (NNS) for all forms of TB, disaggregated by screening point (section A), screening method (section B) and subpopulation (section C). Solid points are pooled estimates over the n interventions in each group that recorded both a screened count and a case count. Bars show the observed range of per-intervention values. A bar ending in an arrow has an undefined upper end, because an intervention in that group screened people and found no one with TB.
+
+**Figure 3: Pooled number needed to screen (NNS) for bacteriologically confirmed TB (B+ TB).** Forest plot detailing the pooled number needed to screen (NNS) for bacteriologically confirmed TB (B+ TB), disaggregated by screening point (section A), screening method (section B) and subpopulation (section C). Solid points are pooled estimates over the n interventions in each group that recorded both a screened count and a case count. Bars show the observed range of per-intervention values. A bar ending in an arrow has an undefined upper end, because an intervention in that group screened people and found no one with TB.
+
+Writes `Figure_pooled_nns_af` and `Figure_pooled_nns_bplus` to `output/`.
+
+```{r}
+#| label: figures
+#| include: true
+#| echo: true
+#| fig-width: 6.26
+#| fig-height: 3.85
+
+# The bar is the observed range of per-intervention NNS, not a CI; the point is
+# pooled over totals. A zero-case intervention runs its bar off the panel and
+# plots no dot.
+
+# Geometry: one 1060 px-wide canvas drawn in a single panel, so a layout px maps
+# to a fixed number of mm. 159 mm is the manuscript's A4 text column.
+fig_w_mm   <- 159      # A4 text column; 190 for a full-bleed double-column journal
+type_scale <- 1.20     # keeps every label at or above 7 pt at 159 mm
+CARD_W     <- 1060     # the layout canvas, in layout px
+
+mm_per_px <- fig_w_mm / CARD_W
+px  <- function(v) v * mm_per_px                # layout px -> mm (geometry)
+tsz <- function(v) v * mm_per_px * type_scale   # layout px -> ggplot text size
+# ggplot draws lines and points about 3/4 of the nominal mm value.
+lw  <- function(v) px(v) / 0.75
+psz <- function(v) px(v) / 0.75
+
+# Helvetica stands in for Source Sans 3. Column widths are measured, not fixed.
+fam <- "Helvetica"
+
+pal <- c("Screening point"  = "#8E2F3C",   # maroon
+         "Screening method" = "#1F6E73",   # peacock
+         "Subpopulation"    = "#A97B23")   # gold
+ink <- "#2A2620"; muted <- "#6E6759"; secondary <- "#8A8375"
+row_rule <- "#F0EBE1"; gridline <- "#E2DCCE"; legend_dot <- "#555046"
+
+# Axis defaults for all forms (data 14 to 2203); B+ passes its own.
+X_LIMITS <- c(12, 2400); X_BREAKS <- c(30, 100, 300, 1000)
+PAD <- 10                                  # gutter between text and plot column
+H_HEADER <- 22; H_ROW <- 25; GAP_SECTION <- 8
+PAD_TOP <- 12; PAD_BOTTOM <- 10; PAD_SIDE <- 16
+CONTENT_W <- CARD_W - 2 * PAD_SIDE            # rules and columns sit inside the padding
+H_TICKS <- 20; GAP_TITLE <- 6; H_TITLE <- 18
+GAP_LEGEND <- 8; H_LEGEND <- 20
+LEGEND_N <- c(1, 10, 25, 50)
+# 14 layout px = 7.2 pt at print size.
+NOTE_PX <- 14
+
+dia_px <- function(n) 4 + 2.1 * sqrt(n)       # mean-marker diameter, layout px
+
+# String width in layout px, measured on the graphics device.
+str_w_px <- function(s, size_px) {
+  if (length(grDevices::dev.list()) == 0) {
+    grDevices::pdf(NULL); on.exit(grDevices::dev.off(), add = TRUE)
+  }
+  fs <- tsz(size_px) / 0.3528                 # mm -> pt
+  vapply(s, function(x) {
+    grid::convertWidth(
+      grid::grobWidth(grid::textGrob(
+        x, gp = grid::gpar(fontfamily = fam, fontsize = fs))),
+      "mm", valueOnly = TRUE) / mm_per_px
+  }, numeric(1), USE.NAMES = FALSE)
+}
+
+# Per-intervention NNS by section and category: the translucent dots.
+per_intervention <- master %>%
+  select(screening_point, screening_method, subpopulation, nns_af, nns_bplus) %>%
+  mutate(across(c(screening_point, screening_method, subpopulation), as.character)) %>%
+  pivot_longer(c(screening_point, screening_method, subpopulation),
+               names_to = "variable", values_to = "option_name") %>%
+  filter(!is.na(option_name)) %>%
+  mutate(variable = factor(variable,
+                           levels = c("screening_point", "screening_method", "subpopulation"),
+                           labels = names(pal)))
+
+nns_figure <- function(which_nns, x_title, x_limits = X_LIMITS, x_breaks = X_BREAKS) {
+  X_MIN <- x_limits[1]; X_MAX <- x_limits[2]; BREAKS <- x_breaks
+  cats <- data_labeled %>%
+    filter(numerator == which_nns) %>%
+    group_by(variable) %>%
+    arrange(WeightedInvMean, .by_group = TRUE) %>%
+    mutate(rank = row_number()) %>%
+    ungroup() %>%
+    mutate(col = unname(pal[as.character(variable)]),
+           # n on the figure is the contributing count (a screened count and a
+           # case count), not the group's membership; so is the point size.
+           n_lab = sprintf("(n=%d)", n_non_missing))
+  # Only finite values have an axis position; an undefined range end is drawn
+  # to the panel edge, an undefined pooled estimate fails.
+  on_axis <- c(cats$WeightedInvMean, cats$Low, cats$High)
+  on_axis <- on_axis[is.finite(on_axis)]
+  stopifnot(
+    "a category has no pooled estimate to plot" = !any(is.na(cats$WeightedInvMean)),
+    "a category has an undefined pooled estimate, which cannot be placed on the axis" =
+      !any(is.infinite(cats$WeightedInvMean)),
+    "a section is missing from the palette"     = !any(is.na(cats$col)),
+    "a pooled estimate or range end falls outside the plotted axis" =
+      all(on_axis >= X_MIN & on_axis <= X_MAX)
+  )
+
+  # Columns sized to the widest string; 288/116 are the floor.
+  w_lab <- max(288, ceiling(max(str_w_px(cats$option_label, 15.5))) + 2 * PAD)
+  w_est <- max(116, ceiling(max(str_w_px(cats$est_fig, 15))) + 2 * PAD)
+  if (w_lab > 288 || w_est > 116) {
+    message("figure columns widened for ", fam, ": labels ", w_lab, " px, estimates ", w_est, " px")
+  }
+  x_lab   <- PAD_SIDE + w_lab - PAD           # labels are right-aligned here
+  x_plot0 <- PAD_SIDE + w_lab
+  w_plot  <- CONTENT_W - w_lab - w_est
+  x_est   <- PAD_SIDE + CONTENT_W - w_est + PAD
+  x_of <- function(v) {
+    x_plot0 + (log10(v) - log10(X_MIN)) / (log10(X_MAX) - log10(X_MIN)) * w_plot
+  }
+
+  # Lay out top-down in layout px, then flip once at the end.
+  cursor <- PAD_TOP
+  sec <- list(); rows <- list()
+  for (s in names(pal)) {
+    dd <- filter(cats, variable == s)
+    hdr_bottom <- cursor + H_HEADER
+    sec[[s]] <- tibble(
+      section = s, letter = LETTERS[match(s, names(pal))], col = unname(pal[s]),
+      rule_y = hdr_bottom - 1.25, text_y = hdr_bottom - 7,
+      rows_top = hdr_bottom, rows_bottom = hdr_bottom + H_ROW * nrow(dd)
+    )
+    rows[[s]] <- dd %>%
+      mutate(y_top = hdr_bottom + (rank - 1) * H_ROW,
+             y_mid = y_top + H_ROW / 2,
+             y_rule = y_top + H_ROW)
+    cursor <- hdr_bottom + H_ROW * nrow(dd) + GAP_SECTION
+  }
+  sec <- bind_rows(sec); rows <- bind_rows(rows)
+  cursor <- cursor - GAP_SECTION                    # no gap after the last section
+
+  ticks_y  <- cursor + 3
+  title_y  <- cursor + H_TICKS + GAP_TITLE + H_TITLE / 2
+  legend_y <- cursor + H_TICKS + GAP_TITLE + H_TITLE + GAP_LEGEND + H_LEGEND / 2
+  total_h  <- cursor + H_TICKS + GAP_TITLE + H_TITLE +
+    GAP_LEGEND + H_LEGEND + PAD_BOTTOM
+  yy <- function(v) total_h - v                     # layout px (top-down) -> plot y
+
+  # is.finite(): a zero-case intervention has no dot but stays in (n) and the pool.
+  pts <- per_intervention %>%
+    mutate(nns = .data[[which_nns]]) %>%
+    filter(is.finite(nns)) %>%
+    inner_join(select(rows, variable, option_name, y_mid, col),
+               by = c("variable", "option_name"))
+  stopifnot(
+    "a per-intervention value did not match a plotted category" =
+      nrow(pts) == sum(is.finite(per_intervention[[which_nns]])),
+    "a per-intervention value falls outside the plotted axis" =
+      all(pts$nns >= X_MIN & pts$nns <= X_MAX)
+  )
+
+  grid_df <- tidyr::expand_grid(select(sec, section, rows_top, rows_bottom), x = BREAKS)
+  # An undefined upper end runs to the panel edge and ends in an open arrowhead.
+  bars <- rows %>%
+    filter(count > 1, !is.na(Low), !is.na(High), High > Low) %>%
+    mutate(x_bar_end = if_else(is.infinite(High), x_of(X_MAX), x_of(High)))
+  bars_defined   <- filter(bars, is.finite(High))
+  bars_undefined <- filter(bars, is.infinite(High))
+  lab_gap <- 4.5                              # one space between the name and "(n=…)"
+
+  g <- ggplot() +
+    # gridlines, confined to their own section's rows
+    geom_segment(data = grid_df,
+                 aes(x = x_of(x), xend = x_of(x),
+                     y = yy(rows_top), yend = yy(rows_bottom)),
+                 colour = gridline, linewidth = lw(1), linetype = "dotted") +
+    # 1 px rule under every row
+    geom_segment(data = rows,
+                 aes(x = PAD_SIDE, xend = PAD_SIDE + CONTENT_W,
+                     y = yy(y_rule), yend = yy(y_rule)),
+                 colour = row_rule, linewidth = lw(1)) +
+    # section rule + header
+    geom_segment(data = sec,
+                 aes(x = PAD_SIDE, xend = PAD_SIDE + CONTENT_W,
+                     y = yy(rule_y), yend = yy(rule_y), colour = col),
+                 linewidth = lw(2.5)) +
+    geom_text(data = sec, aes(x = PAD_SIDE, y = yy(text_y), label = letter, colour = col),
+              hjust = 0, vjust = 0, fontface = "bold", size = tsz(16.5), family = fam) +
+    geom_text(data = sec, aes(x = PAD_SIDE + 15, y = yy(text_y), label = section),
+              hjust = 0, vjust = 0, fontface = "bold", size = tsz(16.5),
+              family = fam, colour = ink) +
+    # range line, then the real per-intervention values, then the pooled estimate
+    geom_segment(data = bars_defined,
+                 aes(x = x_of(Low), xend = x_bar_end, y = yy(y_mid), yend = yy(y_mid),
+                     colour = col),
+                 linewidth = lw(2), lineend = "round") +
+    geom_segment(data = bars_undefined,
+                 aes(x = x_of(Low), xend = x_bar_end, y = yy(y_mid), yend = yy(y_mid),
+                     colour = col),
+                 linewidth = lw(2), lineend = "butt",
+                 arrow = arrow(length = unit(px(9), "mm"), type = "open",
+                               angle = 22, ends = "last")) +
+    geom_point(data = pts, aes(x = x_of(nns), y = yy(y_mid), colour = col),
+               alpha = 0.42, size = psz(7), stroke = 0) +
+    geom_point(data = rows, aes(x = x_of(WeightedInvMean), y = yy(y_mid), colour = col,
+                                size = psz(dia_px(n_non_missing))), stroke = 0) +
+    # label column: name in ink, "(n=…)" in secondary, both right-aligned
+    geom_text(data = rows, aes(x = x_lab, y = yy(y_mid), label = n_lab),
+              hjust = 1, vjust = 0.5, size = tsz(15.5), family = fam, colour = secondary) +
+    geom_text(data = rows,
+              aes(x = x_lab - str_w_px(n_lab, 15.5) - lab_gap, y = yy(y_mid),
+                  label = option_name),
+              hjust = 1, vjust = 0.5, size = tsz(15.5), family = fam, colour = ink) +
+    # estimate column
+    geom_text(data = rows, aes(x = x_est, y = yy(y_mid), label = est_fig),
+              hjust = 0, vjust = 0.5, size = tsz(15), family = fam, colour = ink) +
+    annotate("text", x = x_est, y = yy(sec$text_y[1]), label = "NNS (range)",
+             hjust = 0, vjust = 0, size = tsz(NOTE_PX), fontface = "bold",
+             family = fam, colour = "#000000") +
+    # axis
+    annotate("text", x = x_of(BREAKS), y = yy(ticks_y),
+             label = format(BREAKS, big.mark = ",", trim = TRUE),
+             hjust = 0.5, vjust = 1, size = tsz(14), family = fam, colour = muted) +
+    annotate("text", x = x_plot0 + w_plot / 2, y = yy(title_y), label = x_title,
+             hjust = 0.5, vjust = 0.5, size = tsz(15.5), fontface = "bold",
+             family = fam, colour = ink) +
+    scale_colour_identity() + scale_size_identity() +
+    scale_x_continuous(limits = c(0, CARD_W), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, total_h), expand = c(0, 0)) +
+    coord_cartesian(clip = "off") +
+    theme_void() +
+    theme(plot.margin = margin(0, 0, 0, 0),
+          plot.background = element_rect(fill = "white", colour = NA))
+
+  # size legend: text, then one dot + number per n, laid out left to right and
+  # centred over the plot column (12 px between items, 7 px dot -> number)
+  leg_head <- "Interventions (n)"
+  w_head <- str_w_px(leg_head, 14)
+  w_num  <- str_w_px(as.character(LEGEND_N), 14)
+  d      <- dia_px(LEGEND_N)
+  item_w <- d + 7 + w_num
+  leg_w  <- w_head + sum(item_w) + 12 * length(LEGEND_N)
+  x0     <- x_plot0 + w_plot / 2 - leg_w / 2
+  dot_x  <- x0 + w_head + cumsum(c(0, item_w[-length(item_w)])) + 12 * seq_along(LEGEND_N) + d / 2
+  leg <- tibble(n = LEGEND_N, dot_x = dot_x, num_x = dot_x + d / 2 + 7, size = psz(d))
+
+  g <- g +
+    annotate("text", x = x0, y = yy(legend_y), label = leg_head,
+             hjust = 0, vjust = 0.5, size = tsz(14), family = fam, colour = muted) +
+    geom_point(data = leg, aes(x = dot_x, y = yy(legend_y), size = size),
+               colour = legend_dot, stroke = 0) +
+    geom_text(data = leg, aes(x = num_x, y = yy(legend_y), label = n),
+              hjust = 0, vjust = 0.5, size = tsz(14), family = fam, colour = muted)
+
+  list(plot = g, height_mm = total_h * mm_per_px, rows = rows, points = pts)
+}
+
+f_af    <- nns_figure("nns_af",    "Pooled NNS (all forms TB), log scale")
+f_bplus <- nns_figure("nns_bplus", "Pooled NNS (bacteriologically confirmed TB), log scale",
+                      x_limits = c(20, 5000), x_breaks = c(30, 100, 300, 1000, 3000))
+
+p_af    <- f_af$plot
+p_bplus <- f_bplus$plot
+
+p_af
+p_bplus
+
+# 600 dpi PNG at print size: the submission copy.
+save_figure <- function(plot, stem, width = 8, height = 7.5, units = "in") {
+  ggsave(here("output", paste0(stem, "_600dpi.png")), plot = plot,
+         width = width, height = height, units = units, dpi = 600)
+}
+
+save_figure(p_af, "Figure_pooled_nns_af",
+            width = fig_w_mm, height = f_af$height_mm, units = "mm")
+save_figure(p_bplus, "Figure_pooled_nns_bplus",
+            width = fig_w_mm, height = f_bplus$height_mm, units = "mm")
+```
+
+## The screening cascade
+
+The NNS factorises exactly into the three steps of the screening cascade, an identity that holds by construction:
+
+$$
+\underbrace{\frac{\text{screened}}{\text{cases}}}_{\text{NNS}}
+=
+\underbrace{\frac{\text{screened}}{\text{presumptive}}}_{\text{breadth of screen}}
+\times
+\underbrace{\frac{\text{presumptive}}{\text{tested}}}_{\text{testing coverage}}
+\times
+\underbrace{\frac{\text{tested}}{\text{cases}}}_{\text{diagnostic yield (NNT)}}
+$$
+
+The intermediate terms cancel, so the three factors multiply back to the NNS for a single intervention and, because each factor is a ratio of sums, for any group of interventions. A difference in NNS between two groups can therefore be attributed to the three steps in full and without a modelling assumption.
+
+Breadth of screen is the number of people screened for every person classified as having presumptive TB, where a high value means a narrow screen that identified fewer people with presumptive TB. Testing coverage is the number of people classified presumptive for every person tested, so it sits at 1 where everyone flagged was tested. Diagnostic yield is the number needed to test (NNT). In the manuscript this decomposition is Supplementary S2 and the size gradient is Supplementary S3: most of the difference between strata was found in the breadth of screening, with testing coverage close to 1 and a narrow range of NNT, and breadth of screen was the only step that rose with the size of the intervention.
+
+Everything below uses the all-forms case definition. Bacteriological confirmation changes only the third factor, because fewer cases pass that bar, so running the decomposition twice would repeat the first two columns unchanged. The B+ NNT is in the estimate tables above.
+
+```{r}
+#| label: cascade-terms
+#| include: false
+
+# Named once: legend keys, facet labels and column names.
+stage_names <- c("Breadth of screen (screened per presumptive)",
+                 "Testing coverage (presumptive per tested)",
+                 "Diagnostic yield (tested per case, NNT)")
+
+# count_ratio as in the calculation chunk, so the third term equals nnt_af.
+master <- master %>%
+  mutate(
+    screen_per_presumptive = count_ratio(screened,    presumptive),
+    presumptive_per_tested = count_ratio(presumptive, tested),
+    tested_per_case        = count_ratio(tested,      tb_af)
+  )
+
+# Check the identity where every factor is finite (Inf * 0 is NaN).
+identity_check <- master %>%
+  filter(if_all(c(screen_per_presumptive, presumptive_per_tested,
+                  tested_per_case, nns_af), is.finite))
+stopifnot(
+  "the three-factor decomposition does not reproduce the NNS" =
+    isTRUE(all.equal(
+      identity_check$screen_per_presumptive *
+        identity_check$presumptive_per_tested *
+        identity_check$tested_per_case,
+      identity_check$nns_af
+    ))
+)
+
+# cascade_set: all four cascade counts recorded, 61 of 67 (three of the 64 with a
+# defined NNS have a blanked presumptive count). Zero-case interventions stay in.
+# decomp_set: every factor finite, for the log-scale scatter only.
+cascade_counts <- c("screened", "presumptive", "tested", "tb_af")
+
+cascade_set <- master %>% filter(if_all(all_of(cascade_counts), ~ !is.na(.x)))
+decomp_set  <- cascade_set %>% filter(presumptive > 0, tested > 0, tb_af > 0)
+
+stopifnot(
+  "the cascade set is not the 61 interventions with all four cascade counts" =
+    nrow(cascade_set) == 61
+)
+
+# Ratios of summed counts, so the identity holds exactly.
+pooled_stages <- function(d) {
+  out <- tibble(
+    n           = nrow(d),
+    screened    = sum(d$screened),
+    presumptive = sum(d$presumptive),
+    tested      = sum(d$tested),
+    cases       = sum(d$tb_af)
+  ) %>%
+    mutate(
+      screen_per_presumptive = screened / presumptive,
+      presumptive_per_tested = presumptive / tested,
+      tested_per_case        = tested / cases,
+      nns                    = screened / cases
+    )
+  stopifnot(
+    "pooled factors do not multiply back to the pooled NNS" =
+      isTRUE(all.equal(with(out, screen_per_presumptive *
+                              presumptive_per_tested * tested_per_case),
+                       out$nns))
+  )
+  out
+}
+
+# On the log scale the identity is additive.
+log_factors <- decomp_set %>%
+  transmute(
+    intervention_id, project_code, screened,
+    `Breadth of screen (screened per presumptive)` = log(screen_per_presumptive),
+    `Testing coverage (presumptive per tested)`    = log(presumptive_per_tested),
+    `Diagnostic yield (tested per case, NNT)`      = log(tested_per_case),
+    total                                          = log(nns_af)
+  )
+
+stopifnot(
+  "log factors do not sum to log NNS" =
+    isTRUE(all.equal(rowSums(as.matrix(log_factors[stage_names])), log_factors$total))
+)
+```
+
+```{r}
+#| label: cascade-strata
+#| include: false
+
+# Purpose-built contrasts; the forest-plot combination labels fragment into
+# n = 1 rows. %in% 1 so an unrecorded flag reads as not used.
+membership <- cascade_set %>%
+  mutate(
+    tertile = ntile(screened, 3),
+    any_cxr = screening_methods_cxr %in% 1 | screening_methods_cxr_ai %in% 1,
+
+    `1. Overall|All interventions`             = TRUE,
+    `2. Screening approach|Mass screening`     = screening_stage_mass_screening %in% 1,
+    `2. Screening approach|Not mass screening` = !screening_stage_mass_screening %in% 1,
+    `3. Screening tool|Any chest X-ray`        = any_cxr,
+    `3. Screening tool|No chest X-ray`         = !any_cxr,
+    `4. Volume screened|Largest third`         = tertile == 3,
+    `4. Volume screened|Middle third`          = tertile == 2,
+    `4. Volume screened|Smallest third`        = tertile == 1
+  )
+
+stratum_cols <- str_subset(names(membership), fixed("|"))
+
+cascade_strata <- map_dfr(stratum_cols, function(col) {
+  pooled_stages(filter(membership, .data[[col]])) %>%
+    mutate(stratum = col, .before = 1)
+}) %>%
+  separate_wider_delim(stratum, "|", names = c("section", "label")) %>%
+  # The numeric prefix fixes the order; drop it for display, keep it as levels.
+  mutate(section = fct_inorder(str_remove(section, "^\\d+\\. ")),
+         label   = fct_inorder(label)) %>%
+  arrange(section, label)
+
+stopifnot(
+  "a stratum is empty" = all(cascade_strata$n > 0),
+  "the complementary pairs do not partition the 61" =
+    all(c(sum(cascade_strata$n[cascade_strata$section == "Screening approach"]),
+          sum(cascade_strata$n[cascade_strata$section == "Screening tool"]),
+          sum(cascade_strata$n[cascade_strata$section == "Volume screened"])) == 61)
+)
+```
+
+```{r}
+#| label: cascade-figure-setup
+#| include: false
+
+# Same face and ink as the forest plots and the map; the hues carry the steps.
+panel_bg  <- "#FDFCFA"
+stage_pal <- c("#8E2F3C", "#A97B23", "#1F6E73")   # maroon, gold, peacock
+names(stage_pal) <- stage_names
+
+theme_cascade <- function(base_size = 9) {
+  theme_minimal(base_size = base_size, base_family = fam) +
+    theme(
+      plot.background   = element_rect(fill = "white", colour = NA),
+      panel.background  = element_rect(fill = panel_bg, colour = NA),
+      panel.grid.minor  = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.major.x = element_line(colour = gridline, linewidth = 0.25),
+      axis.text         = element_text(colour = ink),
+      axis.title        = element_text(colour = muted, size = rel(0.95)),
+      strip.text        = element_text(colour = ink, face = "bold", hjust = 0,
+                                       size = rel(0.95)),
+      # Align title and caption to the plot, not the panel.
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      plot.title        = element_text(colour = ink, face = "bold", size = rel(1.25)),
+      plot.subtitle     = element_text(colour = muted, size = rel(0.95), lineheight = 1.2),
+      plot.caption      = element_text(colour = muted, size = rel(0.8), hjust = 0,
+                                       lineheight = 1.25),
+      legend.position   = "top",
+      legend.title      = element_blank(),
+      legend.text       = element_text(colour = ink)
+    )
+}
+```
+
+### Supplementary S2. Decomposition of the number needed to screen into the screening cascade
+
+The identity is multiplicative, so the figure is a waterfall. The x axis is the running product from one person screened to the NNS, and the length of a segment is that step's multiplicative weight.
+
+The strata are purpose-built contrasts: mass screening or not, any chest X-ray against no chest X-ray, and tertiles of the number screened. The combination labels used for the forest plots above describe what projects did, but they fragment into rows of n = 1 and a decomposition cannot use them.
+
+**Supplementary S2, `Figure_cascade_waterfall`: Decomposition of the number needed to screen into the screening cascade.** The NNS (All forms of TB, 61 interventions with a complete cascade) is the product of three steps shown on the figure. The x-axis is logarithmic so the length of each segment is that step's multiplicative weight. Bold figures at the right are the NNS for the stratum.
+
+Writes `Figure_cascade_waterfall` to `output/`.
+
+```{r}
+#| label: figure-cascade-waterfall
+#| include: true
+#| echo: true
+#| fig-width: 7.5
+#| fig-height: 4.2
+
+# Waterfall on a log axis: each step's length is its log contribution, and the
+# middle step can run backwards. fct_inorder keeps the tertile order.
+wf_rows <- cascade_strata %>%
+  mutate(row_label = fct_inorder(sprintf("%s (n=%d)", label, n)))
+
+wf <- wf_rows %>%
+  transmute(
+    section, row_label, nns,
+    c1 = screen_per_presumptive,
+    c2 = screen_per_presumptive * presumptive_per_tested,
+    c3 = screen_per_presumptive * presumptive_per_tested * tested_per_case
+  ) %>%
+  pivot_longer(c(c1, c2, c3), names_to = "step", values_to = "cum_end") %>%
+  group_by(section, row_label) %>%
+  mutate(cum_start = lag(cum_end, default = 1)) %>%
+  ungroup() %>%
+  mutate(
+    stage = factor(recode(step, c1 = stage_names[1], c2 = stage_names[2],
+                          c3 = stage_names[3]), levels = stage_names),
+    x_start = log10(cum_start),
+    x_end   = log10(cum_end)
+  )
+
+stopifnot(
+  "a waterfall row does not end at its stratum NNS" =
+    isTRUE(all.equal(
+      wf %>% filter(step == "c3") %>% pull(cum_end),
+      wf %>% filter(step == "c3") %>% pull(nns)
+    ))
+)
+
+X_MAX <- log10(1200)                       # room for the estimate column
+x_breaks <- c(1, 3, 10, 30, 100, 300)
+
+# In-bar multipliers on the first and third steps only; the middle is too short.
+wf_labels <- wf %>%
+  filter(step %in% c("c1", "c3")) %>%
+  mutate(x_mid = (x_start + x_end) / 2,
+         lab   = sprintf("×%.1f", cum_end / cum_start))
+
+p_waterfall <- ggplot(wf, aes(y = row_label)) +
+  geom_linerange(data = filter(wf, step != "c2"),
+                 aes(xmin = x_start, xmax = x_end, colour = stage),
+                 linewidth = 5.5) +
+  # Thinner and on top, so a backwards step stays visible.
+  geom_linerange(data = filter(wf, step == "c2"),
+                 aes(xmin = x_start, xmax = x_end, colour = stage),
+                 linewidth = 2.2) +
+  geom_text(data = wf_labels, aes(x = x_mid, label = lab),
+            colour = "white", family = fam, size = 2.5, fontface = "bold") +
+  geom_text(data = wf_rows, aes(x = X_MAX, label = disp_range(nns)),
+            hjust = 1, colour = ink, family = fam, size = 3, fontface = "bold") +
+  facet_grid(rows = vars(section), scales = "free_y", space = "free_y",
+             switch = "y",
+             labeller = as_labeller(function(x) str_wrap(x, 11))) +
+  scale_x_continuous(
+    name   = "Running product, from 1 person screened to the number needed to screen (log scale)",
+    breaks = log10(x_breaks), labels = x_breaks,
+    limits = c(0, X_MAX), expand = expansion(mult = c(0.005, 0))
+  ) +
+  scale_y_discrete(name = NULL, limits = rev) +
+  # Wrapped so the three keys fit at 190 mm.
+  scale_colour_manual(values = stage_pal, drop = FALSE,
+                      labels = function(x) str_wrap(x, 26)) +
+  guides(colour = guide_legend(override.aes = list(linewidth = 3), nrow = 1)) +
+  theme_cascade() +
+  # Title and caption live in the document; the colour key stays with the plot.
+  theme(strip.text.y.left = element_text(angle = 0, hjust = 1, vjust = 0.5),
+        strip.placement   = "outside",
+        legend.position   = "bottom",
+        legend.text       = element_text(colour = ink, size = rel(0.78)))
+
+p_waterfall
+
+save_figure(p_waterfall, "Figure_cascade_waterfall",
+            width = 190, height = 107, units = "mm")
+```
+
+### Supplementary S3. Relationship of size of the projects and outcomes
+
+One panel per step, on a shared y axis so that the three can be compared by eye and not only by their slopes.
+
+**Supplementary S3, `Figure_cascade_gradient`: Relationship of size of the projects and outcomes.** Each point is one intervention. Larger interventions classified a much smaller share of those screened as presumptive, while their yield among the people they tested was flat. The figure shows 58 of the 61 interventions with a complete cascade; the three omitted screened people and found no one with TB, so their NNT is undefined. Lines are from the ordinary least squares regression shown to convey direction.
+
+Writes `Figure_cascade_gradient` to `output/`.
+
+```{r}
+#| label: figure-cascade-gradient
+#| include: true
+#| echo: true
+#| fig-width: 8
+#| fig-height: 2.8
+
+grad_long <- log_factors %>%
+  pivot_longer(all_of(stage_names), names_to = "stage", values_to = "log_ratio") %>%
+  mutate(stage = factor(stage, levels = stage_names))
+
+p_gradient <- ggplot(grad_long, aes(x = screened, y = exp(log_ratio))) +
+  geom_smooth(aes(colour = stage), method = "lm", formula = y ~ x, se = FALSE,
+              linewidth = 0.6) +
+  geom_point(aes(colour = stage), alpha = 0.65, size = 1.6, stroke = 0.7) +
+  facet_wrap(~stage, nrow = 1,
+             labeller = as_labeller(function(x) str_wrap(x, 30))) +
+  scale_x_log10(name = "People screened by the intervention",
+                labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  scale_y_log10(name = "Ratio at this step",
+                breaks = c(1, 3, 10, 30, 100, 300),
+                labels = c(1, 3, 10, 30, 100, 300)) +
+  annotation_logticks(sides = "bl", colour = gridline, size = 0.25,
+                      short = unit(0.4, "mm"), mid = unit(0.8, "mm"),
+                      long = unit(1.2, "mm")) +
+  scale_colour_manual(values = stage_pal, guide = "none") +
+  theme_cascade() +
+  theme(panel.grid.major.y = element_line(colour = gridline, linewidth = 0.25))
+
+p_gradient
+
+save_figure(p_gradient, "Figure_cascade_gradient",
+            width = 190, height = 70, units = "mm")
+```
+
+## Session information
+
+Written from inside the render to `session-info/session_info_01_analyze.txt`, because Quarto gives each document its own R process.
+
+```{r}
+#| label: session-info
+#| include: false
+
+dir.create(here("session-info"), showWarnings = FALSE)
+sessioninfo::session_info(
+  pkgs = "loaded",
+  to_file = here("session-info", "session_info_01_analyze.txt")
+)
+```
