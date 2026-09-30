@@ -223,7 +223,7 @@ tbl_specs <- list(
   list(
     header = "Screening Point",
     labels = list(
-      screening_point_intake      = "Intake",
+      screening_point_intake      = "Entry",
       screening_point_in_prison   = "In-prison",
       screening_point_exit        = "Exit",
       screening_point_post_prison = "Post-prison"
@@ -712,21 +712,21 @@ master <- master %>%
     screening_point = recode(
       screening_point,
       "In-prison"                        = "In Prison",
-      "Intake"                           = "Intake",
+      "Intake"                           = "Entry",
       "Exit"                             = "Exit",
       "Post-prison"                      = "Post Prison",
       "Detention-associated environment" = "Detention Associated Environment",
-      "Intake, In-prison"                = "Intake; In Prison",
-      "Intake and In-prison"             = "Intake; In Prison",
+      "Intake, In-prison"                = "Entry; In Prison",
+      "Intake and In-prison"             = "Entry; In Prison",
       "In-prison, Post-prison"           = "In Prison; Post Prison",
-      "Intake, In-prison, Exit"          = "Intake; In Prison; Exit"
+      "Intake, In-prison, Exit"          = "Entry; In Prison; Exit"
     ),
     screening_point = factor(
       screening_point,
       levels = c(
-        "Intake", "In Prison", "Exit", "Post Prison",
-        "Detention Associated Environment", "Intake; In Prison",
-        "In Prison; Post Prison", "Intake; In Prison; Exit"
+        "Entry", "In Prison", "Exit", "Post Prison",
+        "Detention Associated Environment", "Entry; In Prison",
+        "In Prison; Post Prison", "Entry; In Prison; Exit"
       )
     )
   )
